@@ -10,6 +10,7 @@ load_dotenv()
 class BoltConfig:
     client_id: str
     client_secret: str
+    company_id: str
     token_url: str = "https://oidc.bolt.eu/token"
     scope: str = "fleet-integration:api"
 
@@ -37,7 +38,7 @@ def load_config() -> AppConfig:
 
     # Validate required environment variables
     required_vars = [
-        'BOLT_CLIENT_ID', 'BOLT_CLIENT_SECRET',
+        'BOLT_CLIENT_ID', 'BOLT_CLIENT_SECRET', 'BOLT_COMPANY_ID',
         'DISCORD_TOKEN', 'DISCORD_GUILD_IDS'
     ]
 
@@ -48,6 +49,7 @@ def load_config() -> AppConfig:
     bolt_config = BoltConfig(
         client_id=os.getenv('BOLT_CLIENT_ID'),
         client_secret=os.getenv('BOLT_CLIENT_SECRET'),
+        company_id=os.getenv('BOLT_COMPANY_ID'),
         token_url=os.getenv('BOLT_TOKEN_URL', 'https://oidc.bolt.eu/token'),
         scope=os.getenv('BOLT_SCOPE', 'fleet-integration:api')
     )

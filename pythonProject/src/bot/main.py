@@ -35,7 +35,7 @@ class BoltFleetBot(commands.Bot):
         )
 
         # Initialize Bolt Fleet client
-        self.bolt_client = BoltFleetClient(self.oauth_client)
+        self.bolt_client = BoltFleetClient(self.oauth_client, company_id=config.bolt.company_id)
 
     async def setup_hook(self):
         """Setup bot and load extensions"""

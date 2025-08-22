@@ -1,18 +1,19 @@
 import asyncio
-import aiohttp
+import requests
 import time
 import json
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 
 class BoltOAuthClient:
     """
-    Production-ready OAuth2 client for Bolt Fleet API with automatic token refresh.
-    Handles 10-minute token expiration with 2-minute refresh buffer.
+    OAuth2 client using requests library to bypass Cloudflare.
+    Handles both authentication and API requests.
     """
 
     def __init__(self,
@@ -21,7 +22,7 @@ class BoltOAuthClient:
                  token_url: str = "https://oidc.bolt.eu/token",
                  scope: str = "fleet-integration:api",
                  token_file: str = "oauth_token.json",
-                 refresh_buffer: int = 120):  # 2 minutes buffer
+                 refresh_buffer: int = 120):
         self.client_id = client_id
         self.client_secret = client_secret
         self.token_url = token_url
@@ -31,6 +32,7 @@ class BoltOAuthClient:
         self.token = None
         self._token_lock = asyncio.Lock()
         self._refresh_task = None
+        self.executor = ThreadPoolExecutor(max_workers=4)
 
         # Load existing token if available
         self._load_token()
@@ -61,6 +63,25 @@ class BoltOAuthClient:
             return True
         return time.time() + self.refresh_buffer >= self.token['expires_at']
 
+    def _refresh_token_sync(self):
+        """Synchronous token refresh using requests"""
+        data = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'client_credentials',
+            'scope': self.scope
+        }
+
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'curl/7.68.0',
+            'Accept': '*/*'
+        }
+
+        response = requests.post(self.token_url, data=data, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
     async def get_valid_token(self) -> str:
         """Get a valid access token, refreshing if necessary"""
         async with self._token_lock:
@@ -69,36 +90,16 @@ class BoltOAuthClient:
             return self.token['access_token']
 
     async def _refresh_token(self):
-        """Refresh the OAuth2 token using aiohttp with CURL-like headers"""
+        """Refresh the OAuth2 token"""
         try:
             logger.info("Refreshing OAuth2 token...")
 
-            # Prepare the token request data as form data
-            data = aiohttp.FormData()
-            data.add_field('client_id', self.client_id)
-            data.add_field('client_secret', self.client_secret)
-            data.add_field('grant_type', 'client_credentials')
-            data.add_field('scope', self.scope)
-
-            # Headers that mimic CURL to bypass Cloudflare
-            headers = {
-                'User-Agent': 'curl/7.68.0',
-                'Accept': '*/*',
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-
-            # Create a connector with SSL verification
-            connector = aiohttp.TCPConnector(ssl=True)
-
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.post(
-                        self.token_url,
-                        data=data,
-                        headers=headers,
-                        allow_redirects=False
-                ) as response:
-                    response.raise_for_status()
-                    self.token = await response.json()
+            # Run the synchronous requests call in a thread pool
+            loop = asyncio.get_event_loop()
+            self.token = await loop.run_in_executor(
+                self.executor,
+                self._refresh_token_sync
+            )
 
             # Add expires_at timestamp
             if 'expires_in' in self.token:
@@ -132,12 +133,35 @@ class BoltOAuthClient:
         except Exception as e:
             logger.error(f"Scheduled refresh failed: {e}")
 
+    def _make_request_sync(self, method: str, url: str, **kwargs):
+        """Synchronous request using requests library"""
+        headers = kwargs.get('headers', {})
+        headers['User-Agent'] = 'curl/7.68.0'
+        headers['Accept'] = 'application/json'
+        kwargs['headers'] = headers
+
+        if method.upper() == 'GET':
+            response = requests.get(url, **kwargs)
+        elif method.upper() == 'POST':
+            response = requests.post(url, **kwargs)
+        else:
+            response = requests.request(method, url, **kwargs)
+
+        response.raise_for_status()
+
+        # Try to parse as JSON
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            # If not JSON, return as dict with text
+            return {'text': response.text, 'status_code': response.status_code}
+
     async def make_request(self,
-                           session: aiohttp.ClientSession,
+                           session,  # We keep this parameter for compatibility but don't use it
                            method: str,
                            url: str,
                            **kwargs) -> Dict[Any, Any]:
-        """Make an authenticated API request with retry logic"""
+        """Make an authenticated API request using requests library"""
         max_retries = 3
         backoff_factor = 2
 
@@ -146,34 +170,37 @@ class BoltOAuthClient:
                 token = await self.get_valid_token()
                 headers = kwargs.get('headers', {})
                 headers['Authorization'] = f'Bearer {token}'
-                headers['User-Agent'] = 'curl/7.68.0'  # Add CURL user agent
-                headers['Accept'] = 'application/json'
                 kwargs['headers'] = headers
 
-                async with session.request(method, url, **kwargs) as response:
-                    if response.status == 401:
-                        # Token might be invalid, force refresh
-                        logger.warning("Received 401, forcing token refresh")
-                        async with self._token_lock:
-                            await self._refresh_token()
-                        continue
-                    elif response.status == 429:
-                        # Rate limiting
-                        retry_after = int(response.headers.get('Retry-After', 60))
-                        logger.warning(f"Rate limited, waiting {retry_after} seconds")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    elif response.status >= 500:
-                        # Server error, retry with backoff
-                        delay = backoff_factor ** attempt
-                        logger.warning(f"Server error {response.status}, retrying in {delay}s")
-                        await asyncio.sleep(delay)
-                        continue
+                # Run the synchronous request in a thread pool
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    self.executor,
+                    lambda: self._make_request_sync(method, url, **kwargs)
+                )
 
-                    response.raise_for_status()
-                    return await response.json()
+                return response
 
-            except aiohttp.ClientError as e:
+            except requests.HTTPError as e:
+                if e.response.status_code == 401:
+                    logger.warning("Received 401, forcing token refresh")
+                    async with self._token_lock:
+                        await self._refresh_token()
+                    continue
+                elif e.response.status_code == 429:
+                    retry_after = int(e.response.headers.get('Retry-After', 60))
+                    logger.warning(f"Rate limited, waiting {retry_after} seconds")
+                    await asyncio.sleep(retry_after)
+                    continue
+                elif e.response.status_code >= 500:
+                    delay = backoff_factor ** attempt
+                    logger.warning(f"Server error {e.response.status_code}, retrying in {delay}s")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    raise
+
+            except Exception as e:
                 if attempt == max_retries - 1:
                     raise
                 delay = backoff_factor ** attempt
@@ -190,3 +217,4 @@ class BoltOAuthClient:
                 await self._refresh_task
             except asyncio.CancelledError:
                 pass
+        self.executor.shutdown(wait=False)
