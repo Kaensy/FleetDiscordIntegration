@@ -1,6 +1,8 @@
+# Save this as src/bot/cogs/scheduler.py (REPLACE the existing one)
+
 import discord
 from discord.ext import commands, tasks
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, timedelta
 import logging
 
 logger = logging.getLogger(__name__)
@@ -15,17 +17,36 @@ class ScheduledTasks(commands.Cog):
         self.report_channel_id = None  # Set this to your desired channel ID
 
         # Start scheduled tasks
-        self.daily_report.start()
-        self.hourly_update.start()
+        self.sync_database.start()
+        self.midnight_report.start()
 
     def cog_unload(self):
         """Cancel tasks when cog is unloaded"""
-        self.daily_report.cancel()
-        self.hourly_update.cancel()
+        self.sync_database.cancel()
+        self.midnight_report.cancel()
 
-    @tasks.loop(time=time(hour=9, minute=0, tzinfo=timezone.utc))
-    async def daily_report(self):
-        """Send daily fleet report at 9 AM UTC"""
+    @tasks.loop(minutes=10)
+    async def sync_database(self):
+        """Sync database every 10 minutes"""
+        try:
+            async with self.bolt_client:
+                result = await self.bolt_client.sync_database(full_sync=False)
+
+            if result['new_orders'] > 0:
+                logger.info(f"Database sync: {result['new_orders']} new orders added")
+
+                # Notify if significant new orders
+                if result['new_orders'] > 10 and self.report_channel_id:
+                    channel = self.bot.get_channel(self.report_channel_id)
+                    if channel:
+                        await channel.send(f"📊 Database updated: {result['new_orders']} new orders synced")
+
+        except Exception as e:
+            logger.error(f"Database sync failed: {e}")
+
+    @tasks.loop(time=time(hour=22, minute=0, tzinfo=timezone.utc))  # Midnight Romania time (UTC+2)
+    async def midnight_report(self):
+        """Send daily driver report at midnight (Romania time)"""
         try:
             if not self.report_channel_id:
                 logger.warning("Report channel ID not configured")
@@ -36,98 +57,108 @@ class ScheduledTasks(commands.Cog):
                 logger.error(f"Could not find channel with ID {self.report_channel_id}")
                 return
 
-            async with self.bolt_client:
-                # Get yesterday's data
-                fleet_stats = await self.bolt_client.get_fleet_statistics()
-                earnings_data = await self.bolt_client.get_earnings_data()
+            # Get today's data (yesterday since it's run at midnight)
+            today = datetime.now()
+            driver_stats = self.bolt_client.db.get_driver_daily_stats(today)
 
+            if not driver_stats:
+                await channel.send("📊 No driver activity today.")
+                return
+
+            # Create main embed
             embed = discord.Embed(
-                title="📊 Daily Fleet Report",
-                description="Yesterday's fleet performance summary",
+                title=f"📊 Daily Driver Report - {today.strftime('%Y-%m-%d')}",
+                description="Performance summary for all drivers",
                 color=0x0099ff,
                 timestamp=datetime.now(timezone.utc)
             )
 
-            # Key metrics
+            # Add totals
+            total_orders = sum(d['orders_completed'] for d in driver_stats)
+            total_gross = sum(d['gross_earnings'] for d in driver_stats)
+            total_net = sum(d['net_earnings'] for d in driver_stats)
+            total_cash = sum(d['cash_collected'] for d in driver_stats)
+            total_kms = sum(d['kms_traveled'] for d in driver_stats)
+
             embed.add_field(
-                name="🚗 Total Trips",
-                value=str(fleet_stats.get('total_trips', 'N/A')),
-                inline=True
-            )
-            embed.add_field(
-                name="💰 Total Earnings",
-                value=f"€{earnings_data.get('gross_earnings', 0):.2f}",
-                inline=True
-            )
-            embed.add_field(
-                name="⭐ Average Rating",
-                value=f"{fleet_stats.get('average_rating', 0):.2f}",
-                inline=True
+                name="📈 Daily Totals",
+                value=(
+                    f"**Total Orders:** {total_orders}\n"
+                    f"**Gross Earnings:** {total_gross:.2f} RON\n"
+                    f"**Net Earnings:** {total_net:.2f} RON\n"
+                    f"**Cash Collected:** {total_cash:.2f} RON\n"
+                    f"**Distance:** {total_kms:.1f} km"
+                ),
+                inline=False
             )
 
-            # Performance indicators
-            if 'performance_indicators' in fleet_stats:
-                indicators = fleet_stats['performance_indicators']
-                performance_text = []
-                for indicator, value in indicators.items():
-                    performance_text.append(f"• {indicator.replace('_', ' ').title()}: {value}")
-
-                if performance_text:
-                    embed.add_field(
-                        name="📈 Performance Indicators",
-                        value='\n'.join(performance_text[:5]),
-                        inline=False
-                    )
-
-            embed.set_footer(text="Daily automated report • Bolt Fleet API")
-
+            # Send main embed
             await channel.send(embed=embed)
-            logger.info("Daily report sent successfully")
+
+            # Send individual driver reports
+            for driver in driver_stats:
+                driver_embed = discord.Embed(
+                    title=f"👤 {driver['driver_name']}",
+                    color=0x00ff00,
+                    timestamp=datetime.now(timezone.utc)
+                )
+
+                driver_embed.add_field(
+                    name="📊 Performance",
+                    value=(
+                        f"**Orders Completed:** {driver['orders_completed']}\n"
+                        f"**Hours Worked:** {driver['hours_worked']} hrs\n"
+                        f"**KMs Traveled:** {driver['kms_traveled']} km"
+                    ),
+                    inline=True
+                )
+
+                driver_embed.add_field(
+                    name="💰 Earnings",
+                    value=(
+                        f"**Gross:** {driver['gross_earnings']} RON\n"
+                        f"**Net:** {driver['net_earnings']} RON\n"
+                        f"**💵 CASH:** {driver['cash_collected']} RON"
+                    ),
+                    inline=True
+                )
+
+                driver_embed.add_field(
+                    name="📈 Metrics",
+                    value=(
+                        f"**Earnings/Hr:** {driver['earnings_per_hour']} RON/hr\n"
+                        f"**Avg/Order:** {driver['gross_earnings'] / driver['orders_completed']:.2f} RON"
+                    ),
+                    inline=False
+                )
+
+                # Highlight cash collection
+                if driver['cash_collected'] > 0:
+                    driver_embed.set_footer(text=f"⚠️ Cash to collect: {driver['cash_collected']} RON")
+
+                await channel.send(embed=driver_embed)
+
+            logger.info("Midnight report sent successfully")
 
         except Exception as e:
-            logger.error(f"Daily report failed: {e}")
+            logger.error(f"Midnight report failed: {e}")
 
-    @tasks.loop(hours=1)
-    async def hourly_update(self):
-        """Hourly status check and alerts"""
+    @sync_database.before_loop
+    async def before_sync_database(self):
+        """Wait for bot to be ready before starting sync"""
+        await self.bot.wait_until_ready()
+        # Do initial sync on startup
+        logger.info("Performing initial database sync...")
         try:
             async with self.bolt_client:
-                fleet_info = await self.bolt_client.get_fleet_info()
-
-            # Check for alerts (customize based on your needs)
-            alerts = []
-
-            # Example alert conditions
-            if fleet_info.get('active_drivers', 0) < 5:
-                alerts.append("⚠️ Low driver availability: Less than 5 active drivers")
-
-            if fleet_info.get('status') != 'active':
-                alerts.append(f"🚨 Fleet status alert: {fleet_info.get('status')}")
-
-            # Send alerts if any
-            if alerts and self.report_channel_id:
-                channel = self.bot.get_channel(self.report_channel_id)
-                if channel:
-                    alert_embed = discord.Embed(
-                        title="⚠️ Fleet Alerts",
-                        description='\n'.join(alerts),
-                        color=0xff9500,
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    await channel.send(embed=alert_embed)
-                    logger.info(f"Sent {len(alerts)} fleet alerts")
-
+                result = await self.bolt_client.sync_database(full_sync=False)
+            logger.info(f"Initial sync complete: {result['new_orders']} new orders")
         except Exception as e:
-            logger.error(f"Hourly update failed: {e}")
+            logger.error(f"Initial sync failed: {e}")
 
-    @daily_report.before_loop
-    async def before_daily_report(self):
-        """Wait for bot to be ready before starting daily reports"""
-        await self.bot.wait_until_ready()
-
-    @hourly_update.before_loop
-    async def before_hourly_update(self):
-        """Wait for bot to be ready before starting hourly updates"""
+    @midnight_report.before_loop
+    async def before_midnight_report(self):
+        """Wait for bot to be ready before starting midnight reports"""
         await self.bot.wait_until_ready()
 
     @commands.command(name="set-report-channel")
@@ -140,25 +171,41 @@ class ScheduledTasks(commands.Cog):
         await ctx.send(f"✅ Report channel set to {channel.mention}")
         logger.info(f"Report channel set to {channel.id} by {ctx.author}")
 
-    @commands.command(name="test-report")
+    @commands.command(name="test-midnight-report")
     @commands.has_permissions(administrator=True)
-    async def test_report(self, ctx):
-        """Test the daily report functionality"""
+    async def test_midnight_report(self, ctx):
+        """Test the midnight report functionality"""
         try:
-            await ctx.send("🔄 Generating test report...")
+            await ctx.send("🔄 Generating test midnight report...")
 
             # Temporarily set report channel to current channel
             old_channel_id = self.report_channel_id
             self.report_channel_id = ctx.channel.id
 
-            # Run daily report
-            await self.daily_report()
+            # Run midnight report
+            await self.midnight_report()
 
             # Restore original channel
             self.report_channel_id = old_channel_id
 
         except Exception as e:
             await ctx.send(f"❌ Test report failed: {str(e)}")
+
+    @commands.command(name="force-sync")
+    @commands.has_permissions(administrator=True)
+    async def force_sync(self, ctx):
+        """Force an immediate database sync"""
+        try:
+            await ctx.send("🔄 Starting forced sync...")
+
+            async with self.bolt_client:
+                result = await self.bolt_client.sync_database(full_sync=False)
+
+            await ctx.send(f"✅ Sync complete: {result['new_orders']} new orders")
+
+        except Exception as e:
+            logger.error(f"Force sync failed: {e}")
+            await ctx.send(f"❌ Sync failed: {str(e)}")
 
 
 async def setup(bot):

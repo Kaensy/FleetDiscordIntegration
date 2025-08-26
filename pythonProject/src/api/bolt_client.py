@@ -4,6 +4,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 import time
 from ..oauth.client import BoltOAuthClient
+from ..utils.database import FleetDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class BoltFleetClient:
         self.company_id = int(company_id) if company_id else None  # Store as integer
         self.session = None
         self._companies = None
+        self.db = FleetDatabase()
 
     async def __aenter__(self):
         self.session = None  # We don't use aiohttp
@@ -267,34 +269,65 @@ class BoltFleetClient:
             data = response.get('data', {})
             orders = data.get('orders', [])
 
-            total_earnings = 0
-            total_trips = len(orders)
+            gross_earnings = 0
+            net_earnings = 0
+            bolt_fee = 0
+            total_trips = 0
+            completed_trips = []
 
             for order in orders:
-                # Extract price data from order
-                price_data = order.get('price_data', {})
-                if price_data:
-                    # Get various price fields
-                    total_price = price_data.get('total_price', 0)
-                    ride_price = price_data.get('ride_price', 0)
-                    final_price = price_data.get('final_price', 0)
+                # Only count finished orders
+                if order.get('order_status') not in ['finished', 'completed']:
+                    continue
 
-                    # Use the most relevant price
-                    price = total_price or ride_price or final_price
+                # Extract price data from order_price field (not price_data)
+                order_price = order.get('order_price', {})
+                if order_price:
+                    # Get the ride price and net earnings
+                    ride_price = order_price.get('ride_price', 0) or 0
+                    net_amount = order_price.get('net_earnings', 0) or 0
+                    commission = order_price.get('commission', 0) or 0
 
-                    # Convert from cents if needed
-                    if price > 10000:  # Likely in cents
-                        price = price / 100
+                    # Skip orders with no price data
+                    if ride_price == 0 and net_amount == 0:
+                        continue
 
-                    total_earnings += price
+                    gross_earnings += ride_price
+                    net_earnings += net_amount
+                    bolt_fee += commission
+                    total_trips += 1
+                    completed_trips.append(order)
+
+            # Calculate weekly breakdown if we have enough data
+            weekly_breakdown = []
+            if completed_trips:
+                from collections import defaultdict
+                weekly_earnings = defaultdict(float)
+
+                for order in completed_trips:
+                    if order.get('order_finished_timestamp'):
+                        week_start = datetime.fromtimestamp(order['order_finished_timestamp'])
+                        week_start = week_start - timedelta(days=week_start.weekday())
+                        week_key = week_start.strftime('%Y-%m-%d')
+
+                        order_price = order.get('order_price', {})
+                        ride_price = order_price.get('ride_price', 0) or 0
+                        weekly_earnings[week_key] += ride_price
+
+                for week, earnings in sorted(weekly_earnings.items(), reverse=True)[:4]:
+                    weekly_breakdown.append({
+                        'week_start': week,
+                        'earnings': earnings
+                    })
 
             return {
-                "gross_earnings": total_earnings,
-                "net_earnings": total_earnings * 0.8,  # Estimate 20% Bolt fee
-                "bolt_fee": total_earnings * 0.2,
+                "gross_earnings": gross_earnings,
+                "net_earnings": net_earnings,
+                "bolt_fee": bolt_fee,
                 "total_trips": total_trips,
-                "average_per_trip": total_earnings / total_trips if total_trips > 0 else 0,
-                "orders": orders[:5] if orders else []  # Return first 5 orders for display
+                "average_per_trip": gross_earnings / total_trips if total_trips > 0 else 0,
+                "weekly_breakdown": weekly_breakdown,
+                "orders": completed_trips[:5] if completed_trips else []  # Return first 5 completed orders
             }
 
         except Exception as e:
@@ -397,3 +430,7 @@ class BoltFleetClient:
         except Exception as e:
             logger.error(f"Failed to fetch fleet statistics: {e}")
             raise
+
+    async def sync_database(self, full_sync: bool = False) -> Dict[str, Any]:
+        """Sync orders from API to local database"""
+        return await self.db.sync_orders(self, full_sync=full_sync)

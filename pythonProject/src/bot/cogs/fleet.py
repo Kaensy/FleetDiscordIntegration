@@ -1,241 +1,486 @@
 import discord
 from discord.ext import commands
+from discord import ui
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
 
 
+class DaySelectView(ui.View):
+    """Interactive button view for selecting time period"""
+
+    def __init__(self, callback_func, driver_uuid=None):
+        super().__init__(timeout=60)
+        self.callback_func = callback_func
+        self.driver_uuid = driver_uuid
+        self.selected_days = None
+
+    @ui.button(label="1 Day", style=discord.ButtonStyle.primary)
+    async def one_day(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        await self.callback_func(interaction, 1, self.driver_uuid)
+        self.stop()
+
+    @ui.button(label="3 Days", style=discord.ButtonStyle.primary)
+    async def three_days(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        await self.callback_func(interaction, 3, self.driver_uuid)
+        self.stop()
+
+    @ui.button(label="7 Days", style=discord.ButtonStyle.primary)
+    async def seven_days(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        await self.callback_func(interaction, 7, self.driver_uuid)
+        self.stop()
+
+    @ui.button(label="14 Days", style=discord.ButtonStyle.primary)
+    async def fourteen_days(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        await self.callback_func(interaction, 14, self.driver_uuid)
+        self.stop()
+
+    @ui.button(label="30 Days", style=discord.ButtonStyle.success)
+    async def thirty_days(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        await self.callback_func(interaction, 30, self.driver_uuid)
+        self.stop()
+
+    @ui.button(label="ALL TIME", style=discord.ButtonStyle.danger)
+    async def all_time(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer()
+        await self.callback_func(interaction, None, self.driver_uuid)
+        self.stop()
+
+
 class FleetCommands(commands.Cog):
-    """Fleet management commands for Discord bot"""
+    """Custom fleet management commands for DesiSquad"""
 
     def __init__(self, bot):
         self.bot = bot
         self.bolt_client = bot.bolt_client
 
-    @commands.hybrid_command(name="fleet-info", description="Get general fleet information")
-    async def fleet_info(self, ctx):
-        """Display general fleet information"""
+    @commands.hybrid_command(name="fleet-stats", description="Get DesiSquad fleet statistics")
+    async def fleet_stats(self, ctx):
+        """Display fleet statistics"""
         try:
-            await ctx.defer()
+            if hasattr(ctx, 'defer'):
+                await ctx.defer()
+            else:
+                async with ctx.typing():
+                    pass
 
-            async with self.bolt_client:
-                fleet_info = await self.bolt_client.get_fleet_info()
+            # Get stats from database
+            week_stats = self.bolt_client.db.get_fleet_stats(days=7)
+            all_time_stats = self.bolt_client.db.get_fleet_stats()
+            db_stats = self.bolt_client.db.get_database_stats()
 
             embed = discord.Embed(
-                title="🚗 Fleet Information",
+                title="🚗 DesiSquad Fleet Information",
                 color=0x00ff00,
                 timestamp=datetime.now()
             )
 
+            # 7-day stats
             embed.add_field(
-                name="Fleet Name",
-                value=fleet_info.get('name', 'N/A'),
-                inline=True
-            )
-            embed.add_field(
-                name="Total Vehicles",
-                value=fleet_info.get('vehicle_count', 'N/A'),
-                inline=True
-            )
-            embed.add_field(
-                name="Active Drivers",
-                value=fleet_info.get('active_drivers', 'N/A'),
+                name="📊 Last 7 Days",
+                value=(
+                    f"**Trips Completed:** {week_stats['total_trips']}\n"
+                    f"**Distance Traveled:** {week_stats['total_distance_km']} km"
+                ),
                 inline=True
             )
 
-            if 'status' in fleet_info:
-                status_emoji = "🟢" if fleet_info['status'] == 'active' else "🔴"
-                embed.add_field(
-                    name="Fleet Status",
-                    value=f"{status_emoji} {fleet_info['status'].title()}",
-                    inline=True
-                )
+            # All-time stats
+            embed.add_field(
+                name="📈 All Time",
+                value=(
+                    f"**Trips Completed:** {all_time_stats['total_trips']}\n"
+                    f"**Distance Traveled:** {all_time_stats['total_distance_km']} km"
+                ),
+                inline=True
+            )
 
-            embed.set_footer(text="Data from Bolt Fleet API")
+            # Database info
+            embed.add_field(
+                name="💾 Database",
+                value=(
+                    f"**Total Orders:** {db_stats['total_orders']:,}\n"
+                    f"**Size:** {db_stats['database_size_mb']} MB"
+                ),
+                inline=True
+            )
 
-            await ctx.followup.send(embed=embed)
+            embed.set_footer(text="Data from local database • Use !sync to update")
+
+            if hasattr(ctx, 'followup'):
+                await ctx.followup.send(embed=embed)
+            else:
+                await ctx.send(embed=embed)
 
         except Exception as e:
-            logger.error(f"Fleet info command failed: {e}")
-            await ctx.followup.send(f"❌ Failed to fetch fleet information: {str(e)}", ephemeral=True)
+            logger.error(f"Fleet stats command failed: {e}")
+            error_msg = f"❌ Failed to fetch fleet statistics: {str(e)}"
+            if hasattr(ctx, 'followup'):
+                await ctx.followup.send(error_msg, ephemeral=True)
+            else:
+                await ctx.send(error_msg)
 
-    @commands.hybrid_command(name="recent-trips", description="Get recent trip data")
-    @discord.app_commands.describe(days="Number of days to look back (default: 7)")
-    async def recent_trips(self, ctx, days: Optional[int] = 7):
-        """Display recent trip information"""
+    @commands.hybrid_command(name="drivers", description="List all drivers")
+    async def drivers_list(self, ctx):
+        """Display list of all drivers"""
         try:
-            await ctx.defer()
+            if hasattr(ctx, 'defer'):
+                await ctx.defer()
+            else:
+                async with ctx.typing():
+                    pass
 
-            if days < 1 or days > 30:
-                await ctx.followup.send("❌ Days must be between 1 and 30", ephemeral=True)
-                return
+            drivers = self.bolt_client.db.get_all_drivers()
 
-            start_date = datetime.now() - timedelta(days=days)
-
-            async with self.bolt_client:
-                trips = await self.bolt_client.get_trip_data(start_date=start_date, limit=50)
-
-            if not trips:
-                await ctx.followup.send(f"No trips found in the last {days} days.")
+            if not drivers:
+                msg = "No drivers found. Run !sync to update data."
+                if hasattr(ctx, 'followup'):
+                    await ctx.followup.send(msg)
+                else:
+                    await ctx.send(msg)
                 return
 
             embed = discord.Embed(
-                title=f"📊 Recent Trips ({days} days)",
-                description=f"Found {len(trips)} trips",
+                title="👥 Driver List",
+                description="Use driver number with !driver-stats command",
                 color=0x0099ff,
                 timestamp=datetime.now()
             )
 
-            # Calculate summary statistics
-            total_distance = sum(trip.get('distance_km', 0) for trip in trips)
-            total_earnings = sum(trip.get('earnings_eur', 0) for trip in trips)
-            avg_rating = sum(trip.get('rating', 0) for trip in trips if trip.get('rating', 0) > 0) / len(
-                [t for t in trips if t.get('rating', 0) > 0]) if any(trip.get('rating', 0) > 0 for trip in trips) else 0
+            driver_list = []
+            for num, uuid, name in drivers:
+                driver_list.append(f"**{num}.** {name}")
 
-            embed.add_field(name="📍 Total Distance", value=f"{total_distance:.1f} km", inline=True)
-            embed.add_field(name="💰 Total Earnings", value=f"€{total_earnings:.2f}", inline=True)
-            embed.add_field(name="⭐ Avg Rating", value=f"{avg_rating:.2f}" if avg_rating > 0 else "N/A", inline=True)
-
-            # Show recent trips
-            trip_list = []
-            for trip in trips[:5]:  # Show last 5 trips
-                trip_time = trip.get('completed_at', 'Unknown')
-                trip_earnings = trip.get('earnings_eur', 0)
-                trip_distance = trip.get('distance_km', 0)
-                trip_list.append(f"• **{trip_time}** - €{trip_earnings:.2f} ({trip_distance:.1f}km)")
-
-            if trip_list:
-                embed.add_field(
-                    name="🕐 Recent Trips",
-                    value='\n'.join(trip_list),
-                    inline=False
-                )
-
-            embed.set_footer(text="Data from Bolt Fleet API")
-
-            await ctx.followup.send(embed=embed)
-
-        except Exception as e:
-            logger.error(f"Recent trips command failed: {e}")
-            await ctx.followup.send(f"❌ Failed to fetch trip data: {str(e)}", ephemeral=True)
-
-    @commands.hybrid_command(name="earnings", description="Get earnings information")
-    @discord.app_commands.describe(days="Number of days to analyze (default: 30)")
-    async def earnings(self, ctx, days: Optional[int] = 30):
-        """Display earnings information"""
-        try:
-            await ctx.defer()
-
-            if days < 1 or days > 90:
-                await ctx.followup.send("❌ Days must be between 1 and 90", ephemeral=True)
-                return
-
-            start_date = datetime.now() - timedelta(days=days)
-
-            async with self.bolt_client:
-                earnings_data = await self.bolt_client.get_earnings_data(start_date=start_date)
-
-            embed = discord.Embed(
-                title=f"💰 Earnings Report ({days} days)",
-                color=0x00d4aa,
-                timestamp=datetime.now()
+            embed.add_field(
+                name="Drivers",
+                value='\n'.join(driver_list) if driver_list else "No drivers",
+                inline=False
             )
 
-            # Main earnings information
-            gross_earnings = earnings_data.get('gross_earnings', 0)
-            net_earnings = earnings_data.get('net_earnings', 0)
-            bolt_fee = earnings_data.get('bolt_fee', 0)
-            total_trips = earnings_data.get('total_trips', 0)
+            embed.set_footer(text="Use: !driver-stats [number] [days]")
 
-            embed.add_field(name="💵 Gross Earnings", value=f"€{gross_earnings:.2f}", inline=True)
-            embed.add_field(name="🏦 Net Earnings", value=f"€{net_earnings:.2f}", inline=True)
-            embed.add_field(name="🏢 Bolt Fee", value=f"€{bolt_fee:.2f}", inline=True)
-
-            if total_trips > 0:
-                avg_per_trip = gross_earnings / total_trips
-                embed.add_field(name="📊 Trips Count", value=str(total_trips), inline=True)
-                embed.add_field(name="📈 Avg per Trip", value=f"€{avg_per_trip:.2f}", inline=True)
-
-            # Weekly breakdown if available
-            if 'weekly_breakdown' in earnings_data:
-                weekly_text = []
-                for week in earnings_data['weekly_breakdown'][-4:]:  # Last 4 weeks
-                    week_start = week.get('week_start', 'Unknown')
-                    week_earnings = week.get('earnings', 0)
-                    weekly_text.append(f"• Week of {week_start}: €{week_earnings:.2f}")
-
-                if weekly_text:
-                    embed.add_field(
-                        name="📅 Weekly Breakdown",
-                        value='\n'.join(weekly_text),
-                        inline=False
-                    )
-
-            embed.set_footer(text="Data from Bolt Fleet API")
-
-            await ctx.followup.send(embed=embed)
+            if hasattr(ctx, 'followup'):
+                await ctx.followup.send(embed=embed)
+            else:
+                await ctx.send(embed=embed)
 
         except Exception as e:
-            logger.error(f"Earnings command failed: {e}")
-            await ctx.followup.send(f"❌ Failed to fetch earnings data: {str(e)}", ephemeral=True)
+            logger.error(f"Drivers list command failed: {e}")
+            await ctx.send(f"❌ Failed to fetch drivers: {str(e)}")
 
-    @commands.hybrid_command(name="driver-stats", description="Get driver performance statistics")
-    async def driver_stats(self, ctx):
-        """Display driver performance statistics"""
+    @commands.hybrid_command(name="driver-stats", description="Get driver statistics")
+    async def driver_stats(self, ctx, driver_number: int, days: Optional[int] = None):
+        """Display driver statistics with interactive day selection"""
         try:
-            await ctx.defer()
+            if hasattr(ctx, 'defer'):
+                await ctx.defer()
+            else:
+                async with ctx.typing():
+                    pass
 
-            async with self.bolt_client:
-                drivers = await self.bolt_client.get_driver_performance()
-
-            if not drivers:
-                await ctx.followup.send("No driver data available.")
+            # Get driver UUID from number
+            drivers = self.bolt_client.db.get_all_drivers()
+            if driver_number < 1 or driver_number > len(drivers):
+                await ctx.send("❌ Invalid driver number. Use !drivers to see the list.")
                 return
 
-            embed = discord.Embed(
-                title="👥 Driver Performance",
-                description=f"Performance data for {len(drivers)} drivers",
-                color=0xff9500,
-                timestamp=datetime.now()
-            )
+            driver_uuid = drivers[driver_number - 1][1]
+            driver_name = drivers[driver_number - 1][2]
 
-            # Sort drivers by rating
-            sorted_drivers = sorted(drivers, key=lambda x: x.get('rating', 0), reverse=True)
-
-            # Top performers
-            top_drivers = []
-            for driver in sorted_drivers[:5]:
-                name = driver.get('name', 'Unknown')
-                rating = driver.get('rating', 0)
-                trips = driver.get('total_trips', 0)
-                earnings = driver.get('total_earnings', 0)
-                top_drivers.append(f"⭐ **{name}** ({rating:.2f}★) - {trips} trips, €{earnings:.0f}")
-
-            if top_drivers:
-                embed.add_field(
-                    name="🏆 Top Performers",
-                    value='\n'.join(top_drivers),
-                    inline=False
+            if days is None:
+                # Show interactive buttons
+                view = DaySelectView(self._show_driver_stats, driver_uuid)
+                msg = await ctx.send(
+                    f"📊 Select time period for **{driver_name}**'s statistics:",
+                    view=view
                 )
-
-            # Overall statistics
-            total_earnings = sum(driver.get('total_earnings', 0) for driver in drivers)
-            total_trips = sum(driver.get('total_trips', 0) for driver in drivers)
-            avg_rating = sum(driver.get('rating', 0) for driver in drivers) / len(drivers) if drivers else 0
-
-            embed.add_field(name="💰 Total Earnings", value=f"€{total_earnings:.2f}", inline=True)
-            embed.add_field(name="🚗 Total Trips", value=str(total_trips), inline=True)
-            embed.add_field(name="⭐ Avg Rating", value=f"{avg_rating:.2f}", inline=True)
-
-            embed.set_footer(text="Data from Bolt Fleet API")
-
-            await ctx.followup.send(embed=embed)
+            else:
+                # Show stats directly
+                await self._show_driver_stats_direct(ctx, days, driver_uuid)
 
         except Exception as e:
             logger.error(f"Driver stats command failed: {e}")
-            await ctx.followup.send(f"❌ Failed to fetch driver statistics: {str(e)}", ephemeral=True)
+            await ctx.send(f"❌ Failed to fetch driver stats: {str(e)}")
+
+    async def _show_driver_stats(self, interaction: discord.Interaction, days: Optional[int], driver_uuid: str):
+        """Callback for showing driver stats after button selection"""
+        # Fetch state logs for accurate hours
+        async with self.bolt_client:
+            if days:
+                start_date = datetime.now() - timedelta(days=days)
+            else:
+                start_date = datetime(2024, 7, 28)  # Company start date
+
+            state_response = await self.bolt_client.get_fleet_state_logs(
+                start_date=start_date,
+                end_date=datetime.now(),
+                limit=1000
+            )
+            state_logs = state_response.get('data', {}).get('state_logs', []) if state_response.get('code') == 0 else []
+
+        stats = self.bolt_client.db.get_driver_stats_by_uuid(driver_uuid, days, state_logs)
+
+        if not stats:
+            await interaction.followup.send("No data found for this period.")
+            return
+
+        period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
+
+        embed = discord.Embed(
+            title=f"👤 {stats['driver_name']} - {period_text}",
+            color=0xff9500,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="📊 Orders & Earnings",
+            value=(
+                f"**Orders Completed:** {stats['orders_completed']}\n"
+                f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                f"**Net Earnings:** {stats['net_earnings']} RON\n"
+                f"**💵 Cash Collected:** {stats['cash_collected']} RON"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="📍 Distance & Time",
+            value=(
+                f"**Total Distance:** {stats['total_distance']} km\n"
+                f"**Hours Worked:** {stats['hours_worked']} hrs\n"
+                f"**Avg Distance/Trip:** {stats['avg_distance']} km"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="💰 Performance Metrics",
+            value=(
+                f"**Earnings/Hour:** {stats['earnings_per_hour']} RON/hr\n"
+                f"**Earnings/KM:** {stats['earnings_per_km']} RON/km"
+            ),
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed)
+
+    async def _show_driver_stats_direct(self, ctx, days: Optional[int], driver_uuid: str,
+                                        state_logs: Optional[List] = None):
+        """Show driver stats directly without buttons"""
+        if not state_logs:
+            # Fetch state logs if not provided
+            async with self.bolt_client:
+                if days:
+                    start_date = datetime.now() - timedelta(days=days)
+                else:
+                    start_date = datetime(2024, 7, 28)  # Company start date
+
+                state_response = await self.bolt_client.get_fleet_state_logs(
+                    start_date=start_date,
+                    end_date=datetime.now(),
+                    limit=1000
+                )
+                state_logs = state_response.get('data', {}).get('state_logs', []) if state_response.get(
+                    'code') == 0 else []
+
+        stats = self.bolt_client.db.get_driver_stats_by_uuid(driver_uuid, days, state_logs)
+
+        if not stats:
+            await ctx.send("No data found for this period.")
+            return
+
+        period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
+
+        embed = discord.Embed(
+            title=f"👤 {stats['driver_name']} - {period_text}",
+            color=0xff9500,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="📊 Orders & Earnings",
+            value=(
+                f"**Orders Completed:** {stats['orders_completed']}\n"
+                f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                f"**Net Earnings:** {stats['net_earnings']} RON\n"
+                f"**💵 Cash Collected:** {stats['cash_collected']} RON"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="📍 Distance & Time",
+            value=(
+                f"**Total Distance:** {stats['total_distance']} km\n"
+                f"**Hours Worked:** {stats['hours_worked']} hrs\n"
+                f"**Avg Distance/Trip:** {stats['avg_distance']} km"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="💰 Performance Metrics",
+            value=(
+                f"**Earnings/Hour:** {stats['earnings_per_hour']} RON/hr\n"
+                f"**Earnings/KM:** {stats['earnings_per_km']} RON/km"
+            ),
+            inline=False
+        )
+
+        if hasattr(ctx, 'followup'):
+            await ctx.followup.send(embed=embed)
+        else:
+            await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="company-earnings", description="Get company earnings")
+    async def company_earnings(self, ctx, days: Optional[int] = None):
+        """Display company earnings with interactive day selection"""
+        try:
+            if hasattr(ctx, 'defer'):
+                await ctx.defer()
+            else:
+                async with ctx.typing():
+                    pass
+
+            if days is None:
+                # Show interactive buttons
+                view = DaySelectView(self._show_company_earnings)
+                await ctx.send("📊 Select time period for company earnings:", view=view)
+            else:
+                # Show stats directly
+                await self._show_company_earnings_direct(ctx, days)
+
+        except Exception as e:
+            logger.error(f"Company earnings command failed: {e}")
+            await ctx.send(f"❌ Failed to fetch earnings: {str(e)}")
+
+    async def _show_company_earnings(self, interaction: discord.Interaction, days: Optional[int], driver_uuid=None):
+        """Callback for showing company earnings after button selection"""
+        stats = self.bolt_client.db.get_company_earnings(days)
+
+        period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
+
+        embed = discord.Embed(
+            title=f"💰 DesiSquad Earnings - {period_text}",
+            color=0x00d4aa,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="💵 Earnings",
+            value=(
+                f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                f"**Net Earnings:** {stats['net_earnings']} RON"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="📊 Trips",
+            value=(
+                f"**Trips Completed:** {stats['trips_completed']}\n"
+                f"**Total Distance:** {stats['total_distance']} km"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="📈 Metrics",
+            value=(
+                f"**Earnings/Trip:** {stats['earnings_per_trip']} RON\n"
+                f"**Earnings/KM:** {stats['earnings_per_km']} RON"
+            ),
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed)
+
+    async def _show_company_earnings_direct(self, ctx, days: Optional[int]):
+        """Show company earnings directly without buttons"""
+        stats = self.bolt_client.db.get_company_earnings(days)
+
+        period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
+
+        embed = discord.Embed(
+            title=f"💰 DesiSquad Earnings - {period_text}",
+            color=0x00d4aa,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="💵 Earnings",
+            value=(
+                f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                f"**Net Earnings:** {stats['net_earnings']} RON"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="📊 Trips",
+            value=(
+                f"**Trips Completed:** {stats['trips_completed']}\n"
+                f"**Total Distance:** {stats['total_distance']} km"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="📈 Metrics",
+            value=(
+                f"**Earnings/Trip:** {stats['earnings_per_trip']} RON\n"
+                f"**Earnings/KM:** {stats['earnings_per_km']} RON"
+            ),
+            inline=False
+        )
+
+        if hasattr(ctx, 'followup'):
+            await ctx.followup.send(embed=embed)
+        else:
+            await ctx.send(embed=embed)
+
+    @commands.command(name="sync")
+    @commands.cooldown(1, 60, commands.BucketType.guild)
+    async def sync_database(self, ctx, full: bool = False):
+        """Sync orders from Bolt API to local database"""
+        try:
+            await ctx.send("🔄 Starting database sync...")
+
+            async with self.bolt_client:
+                result = await self.bolt_client.sync_database(full_sync=full)
+
+            embed = discord.Embed(
+                title="✅ Database Sync Complete",
+                color=0x00ff00,
+                timestamp=datetime.now()
+            )
+
+            embed.add_field(name="New Orders", value=result['new_orders'], inline=True)
+            embed.add_field(name="Updated Orders", value=result['updated_orders'], inline=True)
+            embed.add_field(name="Total Processed", value=result['total_processed'], inline=True)
+
+            # Get current database stats
+            db_stats = self.bolt_client.db.get_database_stats()
+            embed.add_field(
+                name="Database Status",
+                value=f"**Total Orders:** {db_stats['total_orders']:,}\n**Size:** {db_stats['database_size_mb']} MB",
+                inline=False
+            )
+
+            await ctx.send(embed=embed)
+
+        except commands.CommandOnCooldown as e:
+            await ctx.send(f"⏰ Sync is on cooldown. Try again in {e.retry_after:.0f} seconds.")
+        except Exception as e:
+            logger.error(f"Sync command failed: {e}")
+            await ctx.send(f"❌ Sync failed: {str(e)}")
 
 
 async def setup(bot):

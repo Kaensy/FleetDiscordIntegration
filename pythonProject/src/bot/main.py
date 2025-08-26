@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 import logging
 import asyncio
-from ..oauth.client_requests import BoltOAuthClient
+from ..oauth.client import BoltOAuthClient
 from ..api.bolt_client import BoltFleetClient
 from ..utils.config import AppConfig
 
