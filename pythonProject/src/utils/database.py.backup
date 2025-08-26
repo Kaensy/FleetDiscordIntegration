@@ -18,7 +18,7 @@ class FleetDatabase:
         self.init_database()
 
     def init_database(self):
-        """Initialize database with proper indexes and all required columns"""
+        """Initialize database with proper indexes"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
@@ -36,8 +36,6 @@ class FleetDatabase:
                     order_created_timestamp INTEGER,
                     order_finished_timestamp INTEGER,
                     order_accepted_timestamp INTEGER,
-                    order_pickup_timestamp INTEGER,
-                    order_drop_off_timestamp INTEGER,
                     pickup_lat REAL,
                     pickup_lng REAL,
                     dropoff_lat REAL,
@@ -65,59 +63,8 @@ class FleetDatabase:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(order_status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_payment ON orders(payment_method)')
 
-            # Auto-migrate existing database if columns are missing
-            self._ensure_columns_exist(cursor)
-
             conn.commit()
             logger.info("Database initialized successfully")
-
-    def _ensure_columns_exist(self, cursor):
-        """Ensure all required columns exist, add them if missing"""
-        # Get existing columns
-        cursor.execute("PRAGMA table_info(orders)")
-        existing_columns = [column[1] for column in cursor.fetchall()]
-
-        # Define required columns that might be missing
-        required_columns = [
-            ('order_pickup_timestamp', 'INTEGER'),
-            ('order_drop_off_timestamp', 'INTEGER'),
-        ]
-
-        # Add missing columns
-        for column_name, column_type in required_columns:
-            if column_name not in existing_columns:
-                try:
-                    cursor.execute(f'ALTER TABLE orders ADD COLUMN {column_name} {column_type}')
-                    logger.info(f"Added missing column: {column_name}")
-                except Exception as e:
-                    logger.error(f"Failed to add column {column_name}: {e}")
-
-    def _get_available_columns(self, conn) -> List[str]:
-        """Get list of available columns in the orders table"""
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(orders)")
-        return [column[1] for column in cursor.fetchall()]
-
-    def _build_order_times_query(self, available_columns: List[str]) -> str:
-        """Build query for order times based on available columns"""
-        base_columns = [
-            'order_accepted_timestamp',
-            'order_finished_timestamp'
-        ]
-
-        optional_columns = []
-        if 'order_pickup_timestamp' in available_columns:
-            optional_columns.append('order_pickup_timestamp')
-        else:
-            optional_columns.append('NULL as order_pickup_timestamp')
-
-        if 'order_drop_off_timestamp' in available_columns:
-            optional_columns.append('order_drop_off_timestamp')
-        else:
-            optional_columns.append('NULL as order_drop_off_timestamp')
-
-        all_columns = base_columns + optional_columns
-        return ', '.join(all_columns)
 
     async def sync_orders(self, bolt_client, full_sync: bool = False) -> Dict[str, Any]:
         """Smart sync: Only fetch orders newer than our last sync"""
@@ -204,7 +151,7 @@ class FleetDatabase:
             }
 
     def _store_order(self, conn, order: Dict) -> bool:
-        """Store a single order with all available timestamps"""
+        """Store a single order"""
         try:
             cursor = conn.cursor()
 
@@ -225,10 +172,9 @@ class FleetDatabase:
                     order_reference, driver_uuid, driver_name, order_status,
                     ride_distance, ride_price, net_earnings, commission,
                     order_created_timestamp, order_finished_timestamp, order_accepted_timestamp,
-                    order_pickup_timestamp, order_drop_off_timestamp,
                     pickup_lat, pickup_lng, dropoff_lat, dropoff_lng,
                     vehicle_plate, payment_method, rating
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 order.get('order_reference'),
                 order.get('driver_uuid'),
@@ -241,8 +187,6 @@ class FleetDatabase:
                 order.get('order_created_timestamp'),
                 order.get('order_finished_timestamp'),
                 order.get('order_accepted_timestamp'),
-                order.get('order_pickup_timestamp'),  # NEW
-                order.get('order_drop_off_timestamp'),  # NEW
                 pickup_lat, pickup_lng, dropoff_lat, dropoff_lng,
                 order.get('vehicle_license_plate'),
                 order.get('payment_method'),
@@ -254,53 +198,117 @@ class FleetDatabase:
             logger.error(f"Failed to store order: {e}")
             return False
 
-    def _calculate_working_hours_from_orders(self, order_times: List[Tuple]) -> float:
+    def get_driver_daily_stats(self, date: datetime) -> List[Dict[str, Any]]:
+        """Get daily statistics for each driver based on order finished timestamp"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Calculate start and end of day timestamps
+            start_of_day = datetime(date.year, date.month, date.day)
+            end_of_day = start_of_day + timedelta(days=1)
+            start_ts = int(start_of_day.timestamp())
+            end_ts = int(end_of_day.timestamp())
+
+            # Get stats grouped by driver, using order_finished_timestamp for date filtering
+            cursor.execute('''
+                SELECT 
+                    driver_uuid,
+                    driver_name,
+                    COUNT(*) as orders_completed,
+                    COALESCE(SUM(ride_price), 0) as gross_earnings,
+                    COALESCE(SUM(net_earnings), 0) as net_earnings,
+                    COALESCE(SUM(ride_distance) / 1000.0, 0) as kms_traveled,
+                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN net_earnings ELSE 0 END), 0) as cash_collected
+                FROM orders
+                WHERE order_finished_timestamp >= ? 
+                AND order_finished_timestamp < ?
+                AND order_status = 'finished'
+                GROUP BY driver_uuid
+            ''', (start_ts, end_ts))
+
+            results = []
+            driver_data = cursor.fetchall()
+
+            for row in driver_data:
+                driver_uuid = row[0]
+
+                # Calculate hours worked for this driver on this day using a more conservative approach
+                cursor.execute('''
+                    SELECT 
+                        order_accepted_timestamp,
+                        order_finished_timestamp
+                    FROM orders
+                    WHERE driver_uuid = ?
+                    AND order_finished_timestamp >= ? 
+                    AND order_finished_timestamp < ?
+                    AND order_status = 'finished'
+                    AND order_accepted_timestamp IS NOT NULL
+                    AND order_finished_timestamp IS NOT NULL
+                    ORDER BY order_accepted_timestamp
+                ''', (driver_uuid, start_ts, end_ts))
+
+                order_times = cursor.fetchall()
+                hours_worked = self._calculate_realistic_hours(order_times)
+
+                earnings_per_hour = row[3] / hours_worked if hours_worked > 0 else 0
+
+                results.append({
+                    'driver_uuid': row[0],
+                    'driver_name': row[1],
+                    'orders_completed': row[2],
+                    'gross_earnings': round(row[3], 2),
+                    'net_earnings': round(row[4], 2),
+                    'kms_traveled': round(row[5], 1),
+                    'cash_collected': round(row[6], 2),
+                    'hours_worked': round(hours_worked, 1),
+                    'earnings_per_hour': round(earnings_per_hour, 2)
+                })
+
+            return results
+
+    def _calculate_realistic_hours(self, order_times: List[Tuple[int, int]]) -> float:
         """
-        Calculate ACTIVE working hours (time engaged with customers) - SAFE VERSION
-        This should match what Bolt website shows as "Active online time"
+        Calculate realistic working hours from order timestamps.
+        Groups orders into sessions with max gap of 2 hours between orders.
         """
         if not order_times:
             return 0.0
 
-        total_active_seconds = 0
+        sessions = []
+        current_session_start = order_times[0][0]  # First order accepted time
+        last_order_end = order_times[0][1]  # First order finished time
 
-        # For each order, calculate the time from acceptance to completion
-        # This represents active/engaged time with customers
-        for order_data in order_times:
-            # Handle different tuple lengths safely
-            accepted = order_data[0] if len(order_data) > 0 else None
-            finished = order_data[1] if len(order_data) > 1 else None
-            pickup = order_data[2] if len(order_data) > 2 else None
-            dropoff = order_data[3] if len(order_data) > 3 else None
+        MAX_GAP_SECONDS = 2 * 3600  # 2 hours max gap between orders
 
-            if not accepted or not finished:
-                continue
+        for i in range(1, len(order_times)):
+            order_start = order_times[i][0]
+            order_end = order_times[i][1]
 
-            # Active time = from order acceptance to order completion
-            # This includes: driving to pickup, waiting, picking up, driving to destination, dropping off
-            order_active_time = finished - accepted
+            # If gap between last order end and this order start is > 2 hours, new session
+            if order_start - last_order_end > MAX_GAP_SECONDS:
+                # End current session
+                sessions.append((current_session_start, last_order_end))
+                # Start new session
+                current_session_start = order_start
 
-            # Sanity check: cap individual orders at 2 hours (120 minutes)
-            # Most rides shouldn't take more than 2 hours
-            order_active_time = min(order_active_time, 2 * 3600)
+            last_order_end = order_end
 
-            total_active_seconds += order_active_time
+        # Add the final session
+        sessions.append((current_session_start, last_order_end))
 
-            # Debug logging
-            order_duration_minutes = order_active_time / 60
-            logger.debug(f"Order active time: {order_duration_minutes:.1f} minutes")
+        # Calculate total hours from all sessions
+        total_hours = 0
+        for session_start, session_end in sessions:
+            session_hours = (session_end - session_start) / 3600
+            # Cap individual sessions at 12 hours (sanity check)
+            session_hours = min(session_hours, 12)
+            total_hours += session_hours
 
-        total_active_hours = total_active_seconds / 3600
-        logger.info(f"Total ACTIVE hours calculated: {total_active_hours:.2f}")
-
-        return total_active_hours
+        return total_hours
 
     def calculate_online_hours_from_states(self, driver_uuid: str, start_date: datetime, end_date: datetime,
                                            state_logs: List[Dict]) -> float:
-        """
-        Calculate ACTIVE online hours from state logs - focus on actual work time
-        Website likely shows "active online time" not just "online time"
-        """
+        """Calculate actual online hours from state logs - IMPROVED VERSION"""
         if not state_logs:
             return 0.0
 
@@ -320,116 +328,32 @@ class FleetDatabase:
         # Sort by timestamp
         driver_logs.sort(key=lambda x: x.get('created', 0))
 
-        # Look for patterns that indicate ACTIVE work time
-        # This could be different from just "online" time
-        active_time_seconds = 0
-        current_active_start = None
+        total_online_seconds = 0
+        online_start = None
 
-        logger.debug(f"Processing {len(driver_logs)} state logs for ACTIVE time calculation")
-
-        # Process each state change - focus on actual work states
-        for i, log in enumerate(driver_logs):
+        # Process each state change
+        for log in driver_logs:
             timestamp = log.get('created')
             state = log.get('state', '').lower()
 
-            logger.debug(f"State log {i + 1}: {datetime.fromtimestamp(timestamp)} - {state}")
+            if state in ['active', 'online']:
+                if online_start is None:
+                    online_start = timestamp
+            elif state in ['inactive', 'offline', 'break'] and online_start is not None:
+                # Calculate online duration
+                online_duration = timestamp - online_start
+                # Cap individual sessions at 12 hours (sanity check)
+                online_duration = min(online_duration, 12 * 3600)
+                total_online_seconds += online_duration
+                online_start = None
 
-            # 'active' likely means actually working/engaged with orders
-            if state == 'active':
-                if current_active_start is None:
-                    current_active_start = timestamp
-                    logger.debug(f"  -> Started ACTIVE session at {datetime.fromtimestamp(timestamp)}")
-            elif state in ['inactive', 'offline', 'break', 'online']:
-                # 'online' but not 'active' means available but not engaged
-                if current_active_start is not None:
-                    # Calculate duration of this active session
-                    session_duration = timestamp - current_active_start
-                    # Cap individual sessions at 8 hours (sanity check)
-                    session_duration = min(session_duration, 8 * 3600)
-                    active_time_seconds += session_duration
-                    logger.debug(f"  -> Ended ACTIVE session: {session_duration / 3600:.2f} hours")
-                    current_active_start = None
+        # If driver was still online at end of period
+        if online_start is not None:
+            online_duration = end_ts - online_start
+            online_duration = min(online_duration, 12 * 3600)
+            total_online_seconds += online_duration
 
-        # If driver was still active at end of period
-        if current_active_start is not None:
-            session_duration = end_ts - current_active_start
-            session_duration = min(session_duration, 8 * 3600)
-            active_time_seconds += session_duration
-            logger.debug(f"  -> ACTIVE session continued to end of period: {session_duration / 3600:.2f} hours")
-
-        total_hours = active_time_seconds / 3600
-        logger.info(f"Total ACTIVE hours from state logs for {driver_uuid}: {total_hours:.2f}")
-
-        return total_hours
-
-    def get_driver_daily_stats(self, date: datetime) -> List[Dict[str, Any]]:
-        """Get daily statistics with FIXED date logic - SAFE VERSION"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-
-            # Check available columns
-            available_columns = self._get_available_columns(conn)
-
-            # Fixed: Use the actual date, not date-1
-            start_of_day = datetime(date.year, date.month, date.day, 0, 0, 0)
-            end_of_day = datetime(date.year, date.month, date.day, 23, 59, 59)
-            start_ts = int(start_of_day.timestamp())
-            end_ts = int(end_of_day.timestamp())
-
-            cursor.execute('''
-                SELECT 
-                    driver_uuid,
-                    driver_name,
-                    COUNT(*) as orders_completed,
-                    COALESCE(SUM(ride_price), 0) as gross_earnings,
-                    COALESCE(SUM(net_earnings), 0) as net_earnings,
-                    COALESCE(SUM(ride_distance) / 1000.0, 0) as kms_traveled,
-                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN net_earnings ELSE 0 END), 0) as cash_collected
-                FROM orders
-                WHERE order_finished_timestamp >= ? 
-                AND order_finished_timestamp <= ?
-                AND order_status = 'finished'
-                GROUP BY driver_uuid
-            ''', (start_ts, end_ts))
-
-            results = []
-            driver_data = cursor.fetchall()
-
-            for row in driver_data:
-                driver_uuid = row[0]
-
-                # Calculate hours worked for this specific day - SAFE QUERY
-                order_columns = self._build_order_times_query(available_columns)
-
-                cursor.execute(f'''
-                    SELECT {order_columns}
-                    FROM orders
-                    WHERE driver_uuid = ?
-                    AND order_finished_timestamp >= ? 
-                    AND order_finished_timestamp <= ?
-                    AND order_status = 'finished'
-                    AND order_accepted_timestamp IS NOT NULL
-                    ORDER BY order_accepted_timestamp
-                ''', (driver_uuid, start_ts, end_ts))
-
-                order_times = cursor.fetchall()
-                hours_worked = self._calculate_working_hours_from_orders(order_times)
-
-                earnings_per_hour = row[3] / hours_worked if hours_worked > 0 else 0
-
-                results.append({
-                    'driver_uuid': row[0],
-                    'driver_name': row[1],
-                    'orders_completed': row[2],
-                    'gross_earnings': round(row[3], 2),
-                    'net_earnings': round(row[4], 2),
-                    'kms_traveled': round(row[5], 1),
-                    'cash_collected': round(row[6], 2),
-                    'hours_worked': round(hours_worked, 1),
-                    'earnings_per_hour': round(earnings_per_hour, 2)
-                })
-
-            return results
+        return total_online_seconds / 3600  # Convert to hours
 
     def get_fleet_stats(self, days: Optional[int] = None) -> Dict[str, Any]:
         """Get fleet statistics for specified days or all time"""
@@ -476,50 +400,33 @@ class FleetDatabase:
 
     def get_driver_stats_by_uuid(self, driver_uuid: str, days: Optional[int] = None,
                                  state_logs: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """Get detailed driver statistics with ACTIVE time calculation (matches website) - SAFE VERSION"""
+        """Get detailed driver statistics with improved calculations"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
-            # Check what columns are available
-            available_columns = self._get_available_columns(conn)
-            logger.debug(f"Available database columns: {available_columns}")
-
-            # FIXED DATE LOGIC: 1 day = today only, 3 days = today + 2 previous days
+            # Build query based on days parameter
             if days:
                 end_date = datetime.now()
-                # For "today" (1 day), we want just today
-                if days == 1:
-                    # Today from 00:00:00 to 23:59:59
-                    start_of_today = datetime(end_date.year, end_date.month, end_date.day, 0, 0, 0)
-                    end_of_today = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
-                    start_ts = int(start_of_today.timestamp())
-                    end_ts = int(end_of_today.timestamp())
-                    date_range = f"Today ({start_of_today.strftime('%b %d')})"
-                else:
-                    # For multiple days: today + (days-1) previous days
-                    start_date = end_date - timedelta(days=days - 1)
-                    start_of_period = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0)
-                    end_of_today = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
-                    start_ts = int(start_of_period.timestamp())
-                    end_ts = int(end_of_today.timestamp())
-                    date_range = f"Last {days} days ({start_of_period.strftime('%b %d')} - {end_of_today.strftime('%b %d')})"
-
-                time_filter = "AND order_finished_timestamp >= ? AND order_finished_timestamp <= ?"
+                start_date = end_date - timedelta(days=days)
+                start_ts = int(start_date.timestamp())
+                end_ts = int(end_date.timestamp())
+                time_filter = "AND order_finished_timestamp >= ? AND order_finished_timestamp < ?"
                 params = (driver_uuid, start_ts, end_ts)
+                date_range = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d')}"
             else:
                 time_filter = ""
                 params = (driver_uuid,)
                 date_range = "All Time"
 
-            # Get main stats
+            # Get main stats - FIXED CASH COLLECTION CALCULATION
             cursor.execute(f'''
                 SELECT 
                     driver_name,
                     COUNT(*) as orders_completed,
-                    COALESCE(SUM(CASE WHEN ride_price IS NOT NULL THEN ride_price ELSE 0 END), 0) as gross_earnings,
-                    COALESCE(SUM(CASE WHEN net_earnings IS NOT NULL THEN net_earnings ELSE 0 END), 0) as net_earnings,
+                    COALESCE(SUM(ride_price), 0) as gross_earnings,
+                    COALESCE(SUM(net_earnings), 0) as net_earnings,
                     COALESCE(SUM(ride_distance) / 1000.0, 0) as total_distance,
-                    COALESCE(SUM(CASE WHEN payment_method = 'cash' AND net_earnings IS NOT NULL THEN net_earnings ELSE 0 END), 0) as cash_collected
+                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN net_earnings ELSE 0 END), 0) as cash_collected
                 FROM orders
                 WHERE driver_uuid = ? 
                 AND order_status = 'finished'
@@ -530,11 +437,11 @@ class FleetDatabase:
             if not row or row[1] == 0:  # No orders found
                 return None
 
-            # Get order times for ACTIVE hour calculation - SAFE QUERY
-            order_columns = self._build_order_times_query(available_columns)
-
+            # Get order times for hour calculation
             cursor.execute(f'''
-                SELECT {order_columns}
+                SELECT 
+                    order_accepted_timestamp,
+                    order_finished_timestamp
                 FROM orders
                 WHERE driver_uuid = ? 
                 AND order_status = 'finished'
@@ -545,22 +452,19 @@ class FleetDatabase:
             ''', params)
 
             order_times = cursor.fetchall()
-            logger.info(f"Retrieved {len(order_times)} orders for active time calculation")
 
-            # Calculate ACTIVE hours (time engaged with customers)
-            # Priority: state logs for recent periods, order-based for longer periods
-            if state_logs and days and days <= 30:
+            # Calculate hours worked - prioritize state logs if available
+            if state_logs and days:
                 hours_worked = self.calculate_online_hours_from_states(
                     driver_uuid,
-                    datetime.fromtimestamp(start_ts) if days else datetime.fromtimestamp(0),
-                    datetime.fromtimestamp(end_ts) if days else datetime.now(),
+                    datetime.fromtimestamp(start_ts),
+                    datetime.fromtimestamp(end_ts),
                     state_logs
                 )
-                logger.info(f"Using state logs for ACTIVE time: {hours_worked:.1f} hours for {row[0]}")
+                logger.info(f"Using state logs: {hours_worked} hours for {row[0]}")
             else:
-                # Use order-based ACTIVE time calculation
-                hours_worked = self._calculate_working_hours_from_orders(order_times)
-                logger.info(f"Using order-based ACTIVE time: {hours_worked:.1f} hours for {row[0]}")
+                hours_worked = self._calculate_realistic_hours(order_times)
+                logger.info(f"Using order times: {hours_worked} hours for {row[0]}")
 
             # Calculate derived metrics
             earnings_per_hour = row[2] / hours_worked if hours_worked > 0 else 0
@@ -573,7 +477,7 @@ class FleetDatabase:
                 'gross_earnings': round(row[2], 2),
                 'net_earnings': round(row[3], 2),
                 'total_distance': round(row[4], 1),
-                'hours_worked': round(hours_worked, 1),  # This is now ACTIVE time
+                'hours_worked': round(hours_worked, 1),
                 'earnings_per_hour': round(earnings_per_hour, 2),
                 'earnings_per_km': round(earnings_per_km, 2),
                 'avg_distance': round(avg_distance, 1),

@@ -1,24 +1,49 @@
-# Save this as src/bot/cogs/scheduler.py (REPLACE the existing one)
-
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime, time, timezone, timedelta
 import logging
+import json
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 class ScheduledTasks(commands.Cog):
-    """Scheduled tasks for periodic updates and reports"""
+    """Scheduled tasks for periodic updates and reports with persistent settings"""
 
     def __init__(self, bot):
         self.bot = bot
         self.bolt_client = bot.bolt_client
-        self.report_channel_id = None  # Set this to your desired channel ID
+        self.settings_file = Path("bot_settings.json")
+
+        # Load persistent settings
+        self.settings = self.load_settings()
+        self.report_channel_id = self.settings.get('report_channel_id')
 
         # Start scheduled tasks
         self.sync_database.start()
         self.midnight_report.start()
+
+    def load_settings(self) -> dict:
+        """Load bot settings from file"""
+        if self.settings_file.exists():
+            try:
+                with open(self.settings_file, 'r') as f:
+                    settings = json.load(f)
+                logger.info(f"Loaded settings: {settings}")
+                return settings
+            except Exception as e:
+                logger.error(f"Failed to load settings: {e}")
+        return {}
+
+    def save_settings(self):
+        """Save bot settings to file"""
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+            logger.info(f"Saved settings: {self.settings}")
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
 
     def cog_unload(self):
         """Cancel tasks when cog is unloaded"""
@@ -49,7 +74,7 @@ class ScheduledTasks(commands.Cog):
         """Send daily driver report at midnight (Romania time)"""
         try:
             if not self.report_channel_id:
-                logger.warning("Report channel ID not configured")
+                logger.warning("Report channel ID not configured - skipping midnight report")
                 return
 
             channel = self.bot.get_channel(self.report_channel_id)
@@ -57,12 +82,14 @@ class ScheduledTasks(commands.Cog):
                 logger.error(f"Could not find channel with ID {self.report_channel_id}")
                 return
 
-            # Get today's data (yesterday since it's run at midnight)
-            today = datetime.now()
+            logger.info(f"Sending midnight report to channel {channel.name}")
+
+            # Get today's data (previous day since it's run at midnight)
+            today = datetime.now() - timedelta(days=1)  # Yesterday's data
             driver_stats = self.bolt_client.db.get_driver_daily_stats(today)
 
             if not driver_stats:
-                await channel.send("📊 No driver activity today.")
+                await channel.send(f"📊 No driver activity on {today.strftime('%Y-%m-%d')}.")
                 return
 
             # Create main embed
@@ -107,7 +134,7 @@ class ScheduledTasks(commands.Cog):
                     name="📊 Performance",
                     value=(
                         f"**Orders Completed:** {driver['orders_completed']}\n"
-                        f"**Hours Worked:** {driver['hours_worked']} hrs\n"
+                        f"**Active Hours:** {driver['hours_worked']} hrs\n"  # Updated terminology
                         f"**KMs Traveled:** {driver['kms_traveled']} km"
                     ),
                     inline=True
@@ -126,7 +153,7 @@ class ScheduledTasks(commands.Cog):
                 driver_embed.add_field(
                     name="📈 Metrics",
                     value=(
-                        f"**Earnings/Hr:** {driver['earnings_per_hour']} RON/hr\n"
+                        f"**Earnings/Active Hr:** {driver['earnings_per_hour']} RON/hr\n"  # Updated terminology
                         f"**Avg/Order:** {driver['gross_earnings'] / driver['orders_completed']:.2f} RON"
                     ),
                     inline=False
@@ -161,15 +188,41 @@ class ScheduledTasks(commands.Cog):
         """Wait for bot to be ready before starting midnight reports"""
         await self.bot.wait_until_ready()
 
+        # Log current report channel status
+        if self.report_channel_id:
+            channel = self.bot.get_channel(self.report_channel_id)
+            if channel:
+                logger.info(f"Midnight reports will be sent to: {channel.name} ({channel.id})")
+            else:
+                logger.warning(f"Report channel ID {self.report_channel_id} not found")
+        else:
+            logger.warning("No report channel configured")
+
     @commands.command(name="set-report-channel")
     @commands.has_permissions(administrator=True)
     async def set_report_channel(self, ctx, channel: discord.TextChannel = None):
-        """Set the channel for automated reports"""
+        """Set the channel for automated reports (persists across reboots)"""
         channel = channel or ctx.channel
         self.report_channel_id = channel.id
 
-        await ctx.send(f"✅ Report channel set to {channel.mention}")
-        logger.info(f"Report channel set to {channel.id} by {ctx.author}")
+        # Save to persistent settings
+        self.settings['report_channel_id'] = channel.id
+        self.save_settings()
+
+        await ctx.send(f"✅ Report channel set to {channel.mention} and saved to settings.")
+        logger.info(f"Report channel set to {channel.id} ({channel.name}) by {ctx.author}")
+
+    @commands.command(name="get-report-channel")
+    async def get_report_channel(self, ctx):
+        """Show current report channel setting"""
+        if self.report_channel_id:
+            channel = self.bot.get_channel(self.report_channel_id)
+            if channel:
+                await ctx.send(f"📺 Current report channel: {channel.mention}")
+            else:
+                await ctx.send(f"⚠️ Report channel ID {self.report_channel_id} is set but channel not found")
+        else:
+            await ctx.send("❌ No report channel configured. Use `!set-report-channel` to set one.")
 
     @commands.command(name="test-midnight-report")
     @commands.has_permissions(administrator=True)
@@ -178,7 +231,7 @@ class ScheduledTasks(commands.Cog):
         try:
             await ctx.send("🔄 Generating test midnight report...")
 
-            # Temporarily set report channel to current channel
+            # Temporarily set report channel to current channel for testing
             old_channel_id = self.report_channel_id
             self.report_channel_id = ctx.channel.id
 
@@ -206,6 +259,62 @@ class ScheduledTasks(commands.Cog):
         except Exception as e:
             logger.error(f"Force sync failed: {e}")
             await ctx.send(f"❌ Sync failed: {str(e)}")
+
+    @commands.command(name="status")
+    async def show_status(self, ctx):  # Changed method name - no more bot_
+        """Show current bot configuration and status"""
+        embed = discord.Embed(
+            title="🤖 Bot Status",
+            color=0x00ff99,
+            timestamp=datetime.now()
+        )
+
+        # Database stats
+        db_stats = self.bolt_client.db.get_database_stats()
+        embed.add_field(
+            name="💾 Database",
+            value=(
+                f"**Total Orders:** {db_stats['total_orders']:,}\n"
+                f"**Size:** {db_stats['database_size_mb']} MB"
+            ),
+            inline=True
+        )
+
+        # Report channel
+        if self.report_channel_id:
+            channel = self.bot.get_channel(self.report_channel_id)
+            channel_status = f"#{channel.name}" if channel else "❌ Channel not found"
+        else:
+            channel_status = "❌ Not configured"
+
+        embed.add_field(
+            name="📺 Report Channel",
+            value=channel_status,
+            inline=True
+        )
+
+        # Tasks status
+        sync_status = "✅ Running" if self.sync_database.is_running() else "❌ Stopped"
+        report_status = "✅ Running" if self.midnight_report.is_running() else "❌ Stopped"
+
+        embed.add_field(
+            name="⚙️ Scheduled Tasks",
+            value=(
+                f"**Database Sync:** {sync_status}\n"
+                f"**Midnight Reports:** {report_status}"
+            ),
+            inline=True
+        )
+
+        # Settings file
+        settings_status = "✅ Found" if self.settings_file.exists() else "❌ Missing"
+        embed.add_field(
+            name="📝 Settings",
+            value=f"**File:** {settings_status}",
+            inline=True
+        )
+
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):

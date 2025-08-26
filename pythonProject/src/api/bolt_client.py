@@ -237,6 +237,76 @@ class BoltFleetClient:
             logger.error(f"Failed to fetch fleet state logs: {e}")
             raise
 
+    async def get_state_logs_for_period(self, driver_uuid: str, days: int) -> List[Dict]:
+        """
+        Get state logs for a specific period, handling API limitations and date logic
+        """
+        if days > 30:
+            logger.warning(f"Cannot fetch state logs for {days} days (API limit: 30 days)")
+            return []
+
+        try:
+            end_date = datetime.now()
+            # FIXED DATE LOGIC: 1 day = today only, 3 days = today + 2 previous days
+            start_date = end_date - timedelta(days=days - 1)
+
+            # Set precise time boundaries
+            start_of_period = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0)
+            end_of_period = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
+
+            logger.info(f"Fetching state logs from {start_of_period} to {end_of_period} ({days} days)")
+
+            state_response = await self.get_fleet_state_logs(
+                start_date=start_of_period,
+                end_date=end_of_period,
+                limit=1000
+            )
+
+            if state_response.get('code') == 0:
+                state_logs = state_response.get('data', {}).get('state_logs', [])
+                logger.info(f"Retrieved {len(state_logs)} total state logs")
+
+                # Filter for our specific driver and log some details
+                driver_logs = [log for log in state_logs if log.get('driver_uuid') == driver_uuid]
+                logger.info(f"Found {len(driver_logs)} state logs for target driver")
+
+                if driver_logs:
+                    # Log first and last state for debugging
+                    first_log = driver_logs[0]
+                    last_log = driver_logs[-1] if len(driver_logs) > 1 else first_log
+
+                    logger.info(
+                        f"First state: {datetime.fromtimestamp(first_log.get('created', 0))} - {first_log.get('state')}")
+                    logger.info(
+                        f"Last state: {datetime.fromtimestamp(last_log.get('created', 0))} - {last_log.get('state')}")
+
+                return state_logs  # Return all logs so database method can filter
+            elif state_response.get('code') == 498806:  # INVALID_DATE_RANGE
+                logger.warning(f"Date range too long for state logs API")
+                return []
+            else:
+                logger.error(f"State logs API error {state_response.get('code')}: {state_response.get('message')}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error fetching state logs: {e}")
+            return []
+
+    async def get_driver_stats_with_smart_state_logs(self, driver_uuid: str, days: Optional[int] = None):
+        """
+        Get driver stats with intelligent state logs fetching - IMPROVED VERSION
+        """
+        state_logs = []
+
+        # Only try to fetch state logs for reasonable time periods (≤ 30 days)
+        if days and days <= 30:
+            state_logs = await self.get_state_logs_for_period(driver_uuid, days)
+        else:
+            logger.info(f"Skipping state logs for {'all time' if not days else f'{days} days'} (too long for API)")
+
+        # Get driver stats with or without state logs
+        return self.db.get_driver_stats_by_uuid(driver_uuid, days, state_logs)
+
     # Helper methods to process responses
     async def get_trip_data(self, **kwargs):
         """Get trip data from fleet orders"""
