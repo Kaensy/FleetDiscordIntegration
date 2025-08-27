@@ -71,10 +71,10 @@ class ScheduledTasks(commands.Cog):
 
     @tasks.loop(time=time(hour=22, minute=0, tzinfo=timezone.utc))  # Midnight Romania time (UTC+2)
     async def midnight_report(self):
-        """Send daily driver report at midnight (Romania time)"""
+        """Send daily driver report at midnight (Romania time) with accurate hours"""
         try:
             if not self.report_channel_id:
-                logger.warning("Report channel ID not configured - skipping midnight report")
+                logger.warning("Report channel ID not configured")
                 return
 
             channel = self.bot.get_channel(self.report_channel_id)
@@ -82,14 +82,29 @@ class ScheduledTasks(commands.Cog):
                 logger.error(f"Could not find channel with ID {self.report_channel_id}")
                 return
 
-            logger.info(f"Sending midnight report to channel {channel.name}")
+            # Get today's date
+            today = datetime.now()
 
-            # Get today's data (previous day since it's run at midnight)
-            today = datetime.now() - timedelta(days=1)  # Yesterday's data
-            driver_stats = self.bolt_client.db.get_driver_daily_stats(today)
+            # Fetch state logs for accurate hours calculation
+            state_logs = []
+            try:
+                async with self.bolt_client:
+                    state_response = await self.bolt_client.get_fleet_state_logs(
+                        start_date=datetime(today.year, today.month, today.day),
+                        end_date=datetime.now(),
+                        limit=1000
+                    )
+                    if state_response.get('code') == 0:
+                        state_logs = state_response.get('data', {}).get('state_logs', [])
+                        logger.info(f"Fetched {len(state_logs)} state logs for midnight report")
+            except Exception as e:
+                logger.error(f"Failed to fetch state logs for midnight report: {e}")
+
+            # Get driver stats with state logs
+            driver_stats = self.bolt_client.db.get_driver_daily_stats(today, state_logs)
 
             if not driver_stats:
-                await channel.send(f"📊 No driver activity on {today.strftime('%Y-%m-%d')}.")
+                await channel.send("📊 No driver activity today.")
                 return
 
             # Create main embed
@@ -106,11 +121,13 @@ class ScheduledTasks(commands.Cog):
             total_net = sum(d['net_earnings'] for d in driver_stats)
             total_cash = sum(d['cash_collected'] for d in driver_stats)
             total_kms = sum(d['kms_traveled'] for d in driver_stats)
+            total_hours = sum(d['hours_worked'] for d in driver_stats)
 
             embed.add_field(
                 name="📈 Daily Totals",
                 value=(
                     f"**Total Orders:** {total_orders}\n"
+                    f"**Active Hours:** {total_hours:.1f} hrs\n"
                     f"**Gross Earnings:** {total_gross:.2f} RON\n"
                     f"**Net Earnings:** {total_net:.2f} RON\n"
                     f"**Cash Collected:** {total_cash:.2f} RON\n"
@@ -134,7 +151,7 @@ class ScheduledTasks(commands.Cog):
                     name="📊 Performance",
                     value=(
                         f"**Orders Completed:** {driver['orders_completed']}\n"
-                        f"**Active Hours:** {driver['hours_worked']} hrs\n"  # Updated terminology
+                        f"**Active Hours:** {driver['hours_worked']} hrs\n"
                         f"**KMs Traveled:** {driver['kms_traveled']} km"
                     ),
                     inline=True
@@ -153,7 +170,7 @@ class ScheduledTasks(commands.Cog):
                 driver_embed.add_field(
                     name="📈 Metrics",
                     value=(
-                        f"**Earnings/Active Hr:** {driver['earnings_per_hour']} RON/hr\n"  # Updated terminology
+                        f"**Earnings/Hr:** {driver['earnings_per_hour']} RON/hr\n"
                         f"**Avg/Order:** {driver['gross_earnings'] / driver['orders_completed']:.2f} RON"
                     ),
                     inline=False

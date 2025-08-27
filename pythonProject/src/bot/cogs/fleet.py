@@ -277,80 +277,173 @@ class FleetCommands(commands.Cog):
             logger.error(f"Error in _show_driver_stats: {e}")
             await interaction.followup.send(f"❌ Error generating stats: {str(e)}")
 
-    async def _show_driver_stats_direct(self, ctx, days: Optional[int], driver_uuid: str):
-        """Show driver stats directly without buttons - FINAL VERSION"""
-        try:
-            # Use smart state logs fetching
-            stats = None
-            async with self.bolt_client:
-                stats = await self.bolt_client.get_driver_stats_with_smart_state_logs(driver_uuid, days)
+    async def _show_driver_stats_direct(self, ctx, days: Optional[int], driver_uuid: str,
+                                        state_logs: Optional[List] = None):
+        """Show driver stats directly without buttons"""
 
-            if not stats:
-                await ctx.send("No data found for this period.")
-                return
-
-            period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
-
-            embed = discord.Embed(
-                title=f"👤 {stats['driver_name']} - {period_text}",
-                color=0xff9500,
-                timestamp=datetime.now()
-            )
-
-            embed.add_field(
-                name="📊 Orders & Earnings",
-                value=(
-                    f"**Orders Completed:** {stats['orders_completed']}\n"
-                    f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
-                    f"**Net Earnings:** {stats['net_earnings']} RON\n"
-                    f"**💵 Cash Collected:** {stats['cash_collected']} RON"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="📍 Distance & Time",
-                value=(
-                    f"**Total Distance:** {stats['total_distance']} km\n"
-                    f"**Active Hours:** {stats['hours_worked']} hrs\n"  # Changed from "Hours Worked"
-                    f"**Avg Distance/Trip:** {stats['avg_distance']} km"
-                ),
-                inline=False
-            )
-
-            embed.add_field(
-                name="💰 Performance Metrics",
-                value=(
-                    f"**Earnings/Active Hour:** {stats['earnings_per_hour']} RON/hr\n"  # Clarified
-                    f"**Earnings/KM:** {stats['earnings_per_km']} RON/km"
-                ),
-                inline=False
-            )
-
-            # Update footer to be clearer about what we're calculating
-            footer_text = "Active Hours: "
-            if days and days <= 30:
-                footer_text += "Calculated from state logs (time engaged with orders)"
+        # ALWAYS fetch fresh state logs for accurate hours calculation
+        async with self.bolt_client:
+            if days:
+                start_date = datetime.now() - timedelta(days=days)
             else:
-                footer_text += "Calculated from order timestamps (time engaged with orders)"
+                start_date = datetime(2024, 7, 28)  # Company start date
 
-            if 'data_quality_warning' in stats:
-                footer_text += f" • ⚠️ {stats['data_quality_warning']}"
+            end_date = datetime.now()
 
-            embed.set_footer(text=footer_text)
+            # Fetch state logs with proper parameters
+            state_response = await self.bolt_client.get_fleet_state_logs(
+                start_date=start_date,
+                end_date=end_date,
+                limit=1000  # Ensure we get enough logs
+            )
 
-            if hasattr(ctx, 'followup'):
-                await ctx.followup.send(embed=embed)
+            if state_response.get('code') == 0:
+                state_logs = state_response.get('data', {}).get('state_logs', [])
+                # Filter state logs for this specific driver
+                driver_state_logs = [
+                    log for log in state_logs
+                    if log.get('driver_uuid') == driver_uuid
+                ]
             else:
-                await ctx.send(embed=embed)
+                driver_state_logs = []
+                logger.warning(f"Failed to fetch state logs: {state_response}")
 
-        except Exception as e:
-            logger.error(f"Error in _show_driver_stats_direct: {e}")
-            error_msg = f"❌ Error generating stats: {str(e)}"
-            if hasattr(ctx, 'followup'):
-                await ctx.followup.send(error_msg)
+        # Pass the filtered driver logs
+        stats = self.bolt_client.db.get_driver_stats_by_uuid(
+            driver_uuid,
+            days,
+            driver_state_logs  # Pass filtered logs
+        )
+
+        if not stats:
+            await ctx.send("No data found for this period.")
+            return
+
+        period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
+
+        embed = discord.Embed(
+            title=f"👤 {stats['driver_name']} - {period_text}",
+            color=0xff9500,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="📊 Orders & Earnings",
+            value=(
+                f"**Orders Completed:** {stats['orders_completed']}\n"
+                f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                f"**Net Earnings:** {stats['net_earnings']} RON\n"
+                f"**💵 Cash Collected:** {stats['cash_collected']} RON"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="📍 Distance & Time",
+            value=(
+                f"**Total Distance:** {stats['total_distance']} km\n"
+                f"**Active Hours:** {stats['hours_worked']} hrs\n"
+                f"**Avg Distance/Trip:** {stats['avg_distance']} km"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="💰 Performance Metrics",
+            value=(
+                f"**Earnings/Active Hr:** {stats['earnings_per_hour']} RON/hr\n"
+                f"**Earnings/KM:** {stats['earnings_per_km']} RON/km"
+            ),
+            inline=False
+        )
+
+        # Add note about how hours are calculated
+        embed.set_footer(text="Active Hours: Calculated from state logs (time engaged with orders)")
+
+        if hasattr(ctx, 'followup'):
+            await ctx.followup.send(embed=embed)
+        else:
+            await ctx.send(embed=embed)
+
+    # Also update the callback method _show_driver_stats to match
+    async def _show_driver_stats(self, interaction: discord.Interaction, days: Optional[int], driver_uuid: str):
+        """Callback for showing driver stats after button selection"""
+
+        # Fetch state logs for accurate hours
+        async with self.bolt_client:
+            if days:
+                start_date = datetime.now() - timedelta(days=days)
             else:
-                await ctx.send(error_msg)
+                start_date = datetime(2024, 7, 28)
+
+            end_date = datetime.now()
+
+            state_response = await self.bolt_client.get_fleet_state_logs(
+                start_date=start_date,
+                end_date=end_date,
+                limit=1000
+            )
+
+            if state_response.get('code') == 0:
+                state_logs = state_response.get('data', {}).get('state_logs', [])
+                driver_state_logs = [
+                    log for log in state_logs
+                    if log.get('driver_uuid') == driver_uuid
+                ]
+            else:
+                driver_state_logs = []
+
+        stats = self.bolt_client.db.get_driver_stats_by_uuid(
+            driver_uuid,
+            days,
+            driver_state_logs
+        )
+
+        if not stats:
+            await interaction.followup.send("No data found for this period.")
+            return
+
+        period_text = f"{days} days ({stats['date_range']})" if days else stats['date_range']
+
+        embed = discord.Embed(
+            title=f"👤 {stats['driver_name']} - {period_text}",
+            color=0xff9500,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="📊 Orders & Earnings",
+            value=(
+                f"**Orders Completed:** {stats['orders_completed']}\n"
+                f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                f"**Net Earnings:** {stats['net_earnings']} RON\n"
+                f"**💵 Cash Collected:** {stats['cash_collected']} RON"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="📍 Distance & Time",
+            value=(
+                f"**Total Distance:** {stats['total_distance']} km\n"
+                f"**Active Hours:** {stats['hours_worked']} hrs\n"
+                f"**Avg Distance/Trip:** {stats['avg_distance']} km"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="💰 Performance Metrics",
+            value=(
+                f"**Earnings/Active Hr:** {stats['earnings_per_hour']} RON/hr\n"
+                f"**Earnings/KM:** {stats['earnings_per_km']} RON/km"
+            ),
+            inline=False
+        )
+
+        embed.set_footer(text="Active Hours: Calculated from state logs (time engaged with orders)")
+
+        await interaction.followup.send(embed=embed)
 
     @commands.hybrid_command(name="company-earnings", description="Get company earnings")
     async def company_earnings(self, ctx, days: Optional[int] = None):
@@ -519,7 +612,7 @@ class FleetCommands(commands.Cog):
             embed.add_field(
                 name="Debug Steps",
                 value=(
-                    "1. Run `python test_active_time_calculation.py`\n"
+                    "1. Run `python test_active_hours.py`\n"
                     "2. Check console output for discrepancies\n"
                     "3. Compare with website's 'Active online time'\n"
                     "4. Should be very close to 2h 38min"
