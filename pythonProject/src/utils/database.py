@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
+import pytz
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -353,58 +355,6 @@ class FleetDatabase:
 
         return round(hours, 2)
 
-    def calculate_hours_from_state_logs(self, driver_uuid: str, start_date: datetime,
-                                        end_date: datetime, state_logs: List[Dict]) -> float:
-        """
-        Calculate hours from Bolt's actual state transitions:
-        - waiting_orders = online and available
-        - has_order = on a trip
-        - inactive = offline
-        """
-        # Filter logs for this driver
-        driver_logs = [
-            log for log in state_logs
-            if log.get('driver_uuid') == driver_uuid
-        ]
-
-        if not driver_logs:
-            logger.warning(f"No state logs found for driver {driver_uuid}")
-            return 0.0
-
-        # Sort by timestamp
-        driver_logs.sort(key=lambda x: x.get('created', 0))
-
-        # Calculate online time using Bolt's actual states
-        total_online_seconds = 0
-        online_start = None
-
-        for log in driver_logs:
-            state = log.get('state', '').lower()
-            timestamp = log.get('created', 0)
-
-            # Driver is online (waiting for orders or has an order)
-            if state in ['waiting_orders', 'has_order']:
-                if online_start is None:
-                    online_start = timestamp
-
-            # Driver goes offline (inactive)
-            elif state == 'inactive' and online_start is not None:
-                duration = timestamp - online_start
-                if duration > 0:
-                    total_online_seconds += duration
-                online_start = None
-
-        # If still online at the end of the period
-        if online_start is not None:
-            end_ts = int(end_date.timestamp()) if end_date else int(datetime.now().timestamp())
-            if end_ts > online_start:
-                duration = end_ts - online_start
-                total_online_seconds += duration
-
-        hours = total_online_seconds / 3600
-        logger.info(f"Calculated {hours:.2f} active hours from state logs for driver {driver_uuid}")
-
-        return round(hours, 2)
 
 
     def get_fleet_stats(self, days: Optional[int] = None) -> Dict[str, Any]:
@@ -525,62 +475,102 @@ class FleetDatabase:
                 }
             }
 
-    def calculate_hours_from_state_logs(self, driver_uuid: str, start_date: datetime, end_date: datetime,
-                                        state_logs: List[Dict]) -> float:
+    def calculate_hours_from_states(self, driver_uuid: str, start_date: datetime, end_date: datetime,
+                                    state_logs: List[Dict]) -> Dict[str, float]:
         """
-        Calculate hours from Bolt's actual state transitions:
-        - waiting_orders = online and available
-        - has_order = on a trip
-        - inactive = offline
+        Calculate different types of hours from state logs.
+        Returns dict with total_online_hours, ride_hours, and waiting_hours.
         """
         # Filter logs for this driver
-        driver_logs = [
-            log for log in state_logs
-            if log.get('driver_uuid') == driver_uuid
-        ]
+        driver_logs = [log for log in state_logs if log.get('driver_uuid') == driver_uuid]
 
         if not driver_logs:
-            logger.warning(f"No state logs found for driver {driver_uuid}")
-            return 0.0
+            return {
+                'total_online_hours': 0.0,
+                'ride_hours': 0.0,
+                'waiting_hours': 0.0
+            }
 
         # Sort by timestamp
         driver_logs.sort(key=lambda x: x.get('created', 0))
 
-        # Calculate online time using Bolt's actual states
+        # Convert dates to timestamps for comparison
+        start_ts = int(start_date.timestamp())
+        end_ts = int(end_date.timestamp())
+
+        # Track time in each state
         total_online_seconds = 0
-        online_start = None
+        ride_seconds = 0
+        waiting_seconds = 0
+
+        # Track last state change
+        last_state = None
+        last_timestamp = None
+
+        # Find the state before our time range starts
+        for log in driver_logs:
+            timestamp = log.get('created', 0)
+            if timestamp < start_ts:
+                last_state = log.get('state', '').lower()
+                # We'll use start_ts as the timestamp when we encounter the first log in range
+            else:
+                break
+
+        # If driver was online before the range started, use start_ts as the starting point
+        if last_state in ['waiting_orders', 'has_order', 'busy']:
+            last_timestamp = start_ts
 
         for log in driver_logs:
-            state = log.get('state', '').lower()
             timestamp = log.get('created', 0)
+            state = log.get('state', '').lower()
 
-            # Driver goes online (waiting for orders or has an order)
-            if state in ['waiting_orders', 'has_order']:
-                if online_start is None:
-                    online_start = timestamp
-                    logger.debug(f"Driver went online at {datetime.fromtimestamp(timestamp)}")
+            # Skip logs before our time range
+            if timestamp < start_ts:
+                continue
 
-            # Driver goes offline (inactive)
-            elif state == 'inactive' and online_start is not None:
-                duration = timestamp - online_start
-                if duration > 0:
+            # Cap timestamp at end time if beyond range
+            if timestamp > end_ts:
+                timestamp = end_ts
+
+            # Calculate duration since last state change
+            if last_timestamp is not None and last_timestamp >= start_ts:
+                duration = timestamp - last_timestamp
+
+                # Add duration to appropriate category based on last state
+                if last_state == 'waiting_orders':
+                    waiting_seconds += duration
                     total_online_seconds += duration
-                    logger.debug(
-                        f"Driver went offline at {datetime.fromtimestamp(timestamp)}, duration: {duration / 3600:.2f} hrs")
-                online_start = None
+                elif last_state in ['has_order', 'busy']:  # 'busy' is also considered ride time
+                    ride_seconds += duration
+                    total_online_seconds += duration
+                # 'inactive' doesn't add to any time
 
-        # If still online at the end of the period
-        if online_start is not None:
-            end_ts = int(end_date.timestamp()) if end_date else int(datetime.now().timestamp())
-            if end_ts > online_start:
-                duration = end_ts - online_start
+            # Stop if we've hit the end time
+            if timestamp >= end_ts:
+                break
+
+            # Update state for next iteration
+            last_state = state
+            last_timestamp = timestamp
+
+        # Handle the final state if driver is still online at the end
+        if last_timestamp and last_timestamp < end_ts:
+            final_timestamp = min(end_ts, int(datetime.now().timestamp()))
+            if last_state in ['waiting_orders']:
+                duration = final_timestamp - last_timestamp
+                waiting_seconds += duration
                 total_online_seconds += duration
-                logger.debug(f"Driver still online at end, adding {duration / 3600:.2f} hrs")
+            elif last_state in ['has_order', 'busy']:
+                duration = final_timestamp - last_timestamp
+                ride_seconds += duration
+                total_online_seconds += duration
 
-        hours = total_online_seconds / 3600
-        logger.info(f"Calculated {hours:.2f} active hours from state logs for driver {driver_uuid}")
-
-        return round(hours, 2)
+        # Convert to hours and round
+        return {
+            'total_online_hours': round(total_online_seconds / 3600, 2),
+            'ride_hours': round(ride_seconds / 3600, 2),
+            'waiting_hours': round(waiting_seconds / 3600, 2)
+        }
 
     def calculate_hours_from_ride_durations(self, driver_uuid: str, start_date: datetime, end_date: datetime) -> float:
         """
@@ -745,27 +735,63 @@ class FleetDatabase:
 
     def get_driver_stats_by_uuid(self, driver_uuid: str, days: Optional[int] = None,
                                  state_logs: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """Enhanced driver statistics with detailed time tracking"""
+        """Get detailed driver statistics with proper timezone handling"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
+            # Use Romanian timezone
+            try:
+                romania_tz = pytz.timezone('Europe/Bucharest')
+            except:
+                # Fallback if pytz is not installed
+                romania_tz = None
+
             # Build query based on days parameter
             if days:
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days)
+                if romania_tz:
+                    # Get current time in Romania
+                    now_romania = datetime.now(romania_tz)
+
+                    # For "1 day", we want TODAY only (from midnight to now)
+                    # For "2 days", we want YESTERDAY and TODAY
+                    # Start date is X days ago at midnight
+                    start_date = now_romania.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+                        days=days - 1)
+                    end_date = now_romania  # Current moment
+
+                    # Remove timezone info for timestamp conversion
+                    start_date = start_date.replace(tzinfo=None)
+                    end_date = end_date.replace(tzinfo=None)
+                else:
+                    # Fallback without timezone
+                    now = datetime.now()
+                    start_date = datetime(now.year, now.month, now.day) - timedelta(days=days - 1)
+                    end_date = now
+
                 start_ts = int(start_date.timestamp())
                 end_ts = int(end_date.timestamp())
-                time_filter = "AND order_finished_timestamp >= ? AND order_finished_timestamp < ?"
+
+                time_filter = "AND order_finished_timestamp >= ? AND order_finished_timestamp <= ?"
                 params = (driver_uuid, start_ts, end_ts)
-                date_range = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d')}"
+
+                # Format date range for display
+                if days == 1:
+                    date_range = f"Today ({start_date.strftime('%b %d')})"
+                elif days == 2:
+                    date_range = f"{start_date.strftime('%b %d')} - Today"
+                else:
+                    date_range = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d')}"
             else:
-                start_date = datetime(2024, 7, 28)  # Company start date
+                # All time - use company start date
+                start_date = datetime(2024, 7, 28, 0, 0, 0)
                 end_date = datetime.now()
+
+                start_ts = int(start_date.timestamp())
+                end_ts = int(end_date.timestamp())
+
                 time_filter = ""
                 params = (driver_uuid,)
                 date_range = "All Time"
-                start_ts = int(start_date.timestamp())
-                end_ts = int(end_date.timestamp())
 
             # Get main stats
             cursor.execute(f'''
@@ -775,7 +801,7 @@ class FleetDatabase:
                     COALESCE(SUM(ride_price), 0) as gross_earnings,
                     COALESCE(SUM(net_earnings), 0) as net_earnings,
                     COALESCE(SUM(ride_distance) / 1000.0, 0) as total_distance,
-                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN (ride_price - commission) ELSE 0 END), 0) as cash_collected
+                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN net_earnings ELSE 0 END), 0) as cash_collected
                 FROM orders
                 WHERE driver_uuid = ? 
                 AND order_status = 'finished'
@@ -788,15 +814,22 @@ class FleetDatabase:
 
             # Calculate hours from state logs if provided
             if state_logs:
-                hours_data = self.calculate_driver_hours_from_states(
+                hours_data = self.calculate_hours_from_states(
                     driver_uuid,
-                    datetime.fromtimestamp(start_ts),
-                    datetime.fromtimestamp(end_ts),
+                    start_date,
+                    end_date,
                     state_logs
                 )
                 total_online_hours = hours_data['total_online_hours']
+                ride_hours = hours_data['ride_hours']
                 waiting_hours = hours_data['waiting_hours']
-                active_hours = hours_data['active_hours']
+
+                # Debug logging
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"Hours for {row[0]} ({days} days): Total={total_online_hours}, Rides={ride_hours}, Waiting={waiting_hours}")
+                logger.info(f"Date range: {start_date} to {end_date}")
             else:
                 # Fallback to order-based calculation (less accurate)
                 cursor.execute(f'''
@@ -819,11 +852,10 @@ class FleetDatabase:
                         total_online_hours += daily_hours
 
                 total_online_hours = round(total_online_hours, 2)
-                # Can't accurately determine waiting vs active without state logs
+                ride_hours = total_online_hours  # Can't separate without state logs
                 waiting_hours = 0
-                active_hours = total_online_hours
 
-            # Calculate derived metrics using total online hours
+            # Calculate derived metrics
             earnings_per_hour = row[2] / total_online_hours if total_online_hours > 0 else 0
             earnings_per_km = row[2] / row[4] if row[4] > 0 else 0
             avg_distance = row[4] / row[1] if row[1] > 0 else 0
@@ -834,10 +866,9 @@ class FleetDatabase:
                 'gross_earnings': round(row[2], 2),
                 'net_earnings': round(row[3], 2),
                 'total_distance': round(row[4], 1),
-                'total_online_hours': total_online_hours,
-                'waiting_hours': waiting_hours,
-                'active_hours': active_hours,
-                'hours_worked': total_online_hours,  # Keep for backward compatibility
+                'hours_worked': total_online_hours,  # Total online time
+                'ride_hours': ride_hours,  # Time on rides
+                'waiting_hours': waiting_hours,  # Time waiting for orders
                 'earnings_per_hour': round(earnings_per_hour, 2),
                 'earnings_per_km': round(earnings_per_km, 2),
                 'avg_distance': round(avg_distance, 1),
@@ -846,13 +877,13 @@ class FleetDatabase:
             }
 
     def get_driver_daily_stats(self, date: datetime) -> List[Dict[str, Any]]:
-        """Enhanced daily statistics with proper hours calculation"""
+        """Get daily statistics for each driver based on order finished timestamp"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
             # Calculate start and end of day timestamps
-            start_of_day = datetime(date.year, date.month, date.day)
-            end_of_day = start_of_day + timedelta(days=1)
+            start_of_day = datetime(date.year, date.month, date.day, 0, 0, 0)
+            end_of_day = start_of_day + timedelta(days=1) - timedelta(seconds=1)
             start_ts = int(start_of_day.timestamp())
             end_ts = int(end_of_day.timestamp())
 
@@ -868,7 +899,7 @@ class FleetDatabase:
                     COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN net_earnings ELSE 0 END), 0) as cash_collected
                 FROM orders
                 WHERE order_finished_timestamp >= ? 
-                AND order_finished_timestamp < ?
+                AND order_finished_timestamp <= ?
                 AND order_status = 'finished'
                 GROUP BY driver_uuid
             ''', (start_ts, end_ts))
@@ -876,8 +907,6 @@ class FleetDatabase:
             results = []
             driver_data = cursor.fetchall()
 
-            # Note: For daily stats, we don't have state logs readily available
-            # So we use the order-based calculation
             for row in driver_data:
                 driver_uuid = row[0]
 
@@ -889,7 +918,7 @@ class FleetDatabase:
                     FROM orders
                     WHERE driver_uuid = ?
                     AND order_finished_timestamp >= ? 
-                    AND order_finished_timestamp < ?
+                    AND order_finished_timestamp <= ?
                     AND order_status = 'finished'
                     AND order_accepted_timestamp IS NOT NULL
                 ''', (driver_uuid, start_ts, end_ts))
