@@ -943,3 +943,246 @@ class FleetDatabase:
                 })
 
             return results
+
+    def get_driver_stats_by_date_range(self, driver_uuid: str, start_date: datetime, end_date: datetime,
+                                                state_logs: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        """
+        Get detailed driver statistics with complete time tracking.
+        Calculates both active hours and waiting hours accurately.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Convert dates to timestamps
+            start_ts = int(start_date.timestamp())
+            end_ts = int(end_date.timestamp())
+
+            # Get main stats
+            cursor.execute('''
+                SELECT 
+                    driver_name,
+                    COUNT(*) as orders_completed,
+                    COALESCE(SUM(ride_price), 0) as gross_earnings,
+                    COALESCE(SUM(net_earnings), 0) as net_earnings,
+                    COALESCE(SUM(ride_distance) / 1000.0, 0) as total_distance,
+                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN net_earnings ELSE 0 END), 0) as cash_collected
+                FROM orders
+                WHERE driver_uuid = ? 
+                AND order_status = 'finished'
+                AND order_finished_timestamp >= ?
+                AND order_finished_timestamp < ?
+            ''', (driver_uuid, start_ts, end_ts))
+
+            row = cursor.fetchone()
+            if not row or row[1] == 0:  # No orders found
+                return None
+
+            # Calculate ACTIVE hours (time on rides)
+            active_hours = self.calculate_active_hours_from_orders(driver_uuid, start_ts, end_ts)
+
+            # Calculate WAITING hours
+            waiting_hours = 0
+
+            # First try state logs if available
+            if state_logs:
+                states_in_logs = set(
+                    log.get('state', '').lower()
+                    for log in state_logs
+                    if log.get('driver_uuid') == driver_uuid
+                )
+
+                if 'waiting_orders' in states_in_logs:
+                    # Use state logs for precise waiting time
+                    hours_data = self.calculate_hours_from_states(
+                        driver_uuid,
+                        start_date,
+                        end_date,
+                        state_logs
+                    )
+                    waiting_hours = hours_data.get('waiting_hours', 0)
+
+                    # If state logs show different active hours, use the more conservative number
+                    state_active = hours_data.get('ride_hours', 0)
+                    if state_active > 0 and abs(state_active - active_hours) < 2:
+                        # If they're close (within 2 hours), use state logs as they're more accurate
+                        active_hours = state_active
+
+            # If no state logs or no waiting data, estimate from order gaps
+            if waiting_hours == 0:
+                waiting_hours = self.calculate_waiting_hours_from_orders(driver_uuid, start_ts, end_ts)
+
+            # Total online hours = active + waiting
+            total_online_hours = round(active_hours + waiting_hours, 2)
+
+            # Calculate earnings metrics
+            # Bolt uses TOTAL online hours for earnings/hour calculation
+            earnings_per_hour_total = row[2] / total_online_hours if total_online_hours > 0 else 0
+            # But you might also want earnings per ACTIVE hour
+            earnings_per_hour_active = row[2] / active_hours if active_hours > 0 else 0
+
+            earnings_per_km = row[2] / row[4] if row[4] > 0 else 0
+            avg_distance = row[4] / row[1] if row[1] > 0 else 0
+
+            # Format date range text
+            if start_date.date() == end_date.date():
+                date_range = start_date.strftime('%B %d, %Y')
+            else:
+                # Check if it's a full month
+                if start_date.day == 1 and end_date.day == 1 and (
+                        end_date.month == start_date.month + 1 or (start_date.month == 12 and end_date.month == 1)):
+                    date_range = start_date.strftime('%B %Y')
+                else:
+                    end_display = end_date - timedelta(seconds=1)
+                    date_range = f"{start_date.strftime('%b %d')} - {end_display.strftime('%b %d, %Y')}"
+
+            return {
+                'driver_name': row[0],
+                'orders_completed': row[1],
+                'gross_earnings': round(row[2], 2),
+                'net_earnings': round(row[3], 2),
+                'total_distance': round(row[4], 1),
+                'hours_worked': active_hours,  # Active time (on rides)
+                'waiting_hours': waiting_hours,  # Time waiting for orders
+                'total_online_hours': total_online_hours,  # Total time online
+                'earnings_per_hour': round(earnings_per_hour_total, 2),  # Using total hours like Bolt
+                'earnings_per_hour_active': round(earnings_per_hour_active, 2),  # Per active hour
+                'earnings_per_km': round(earnings_per_km, 2),
+                'avg_distance': round(avg_distance, 1),
+                'cash_collected': round(row[5], 2),
+                'date_range': date_range
+            }
+
+    def calculate_active_hours_from_orders(self, driver_uuid: str, start_ts: int, end_ts: int) -> float:
+        """
+        Calculate ACTIVE hours by summing individual ride durations.
+        More precise calculation to match Bolt's exact methodology.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Get all finished orders - use order_finished_timestamp for date filtering
+            # This ensures rides are counted in the day they finished (as you specified)
+            cursor.execute('''
+                SELECT 
+                    order_accepted_timestamp,
+                    order_finished_timestamp,
+                    order_pickup_timestamp,
+                    order_drop_off_timestamp,
+                    order_reference,
+                    ride_distance
+                FROM orders
+                WHERE driver_uuid = ?
+                AND order_status = 'finished'
+                AND order_finished_timestamp >= ?
+                AND order_finished_timestamp < ?
+                AND order_accepted_timestamp IS NOT NULL
+                AND order_finished_timestamp IS NOT NULL
+                ORDER BY order_accepted_timestamp
+            ''', (driver_uuid, start_ts, end_ts))
+
+            orders = cursor.fetchall()
+
+            if not orders:
+                return 0.0
+
+            total_active_seconds = 0
+
+            for order in orders:
+                accepted = order[0]
+                finished = order[1]
+                pickup = order[2]
+                dropoff = order[3]
+                reference = order[4]
+                distance = order[5]
+
+                if accepted and finished and finished > accepted:
+                    # Calculate ride duration
+                    ride_duration = finished - accepted
+
+                    # More refined sanity checks based on distance
+                    # Average speed shouldn't exceed 60 km/h in city driving
+                    if distance and distance > 0:
+                        # Convert distance from meters to km
+                        distance_km = distance / 1000.0
+                        # Minimum reasonable time for this distance (at 60 km/h average)
+                        min_time = (distance_km / 60) * 3600  # in seconds
+                        # Maximum reasonable time (at 10 km/h average - heavy traffic)
+                        max_time = (distance_km / 10) * 3600  # in seconds
+
+                        # Apply constraints
+                        if ride_duration < min_time:
+                            logger.debug(
+                                f"Order {reference}: Duration {ride_duration}s seems too short for {distance_km}km")
+                            ride_duration = min_time
+                        elif ride_duration > max_time:
+                            logger.debug(
+                                f"Order {reference}: Duration {ride_duration}s seems too long for {distance_km}km")
+                            ride_duration = max_time
+                    else:
+                        # No distance data - apply general cap of 2 hours
+                        ride_duration = min(ride_duration, 2 * 3600)
+
+                    total_active_seconds += ride_duration
+
+            # Convert to hours with 2 decimal precision
+            active_hours = total_active_seconds / 3600
+
+            # Round to match Bolt's precision (they show hours and minutes)
+            # Convert to hours and minutes, then back to decimal
+            total_minutes = round(total_active_seconds / 60)
+            active_hours = total_minutes / 60
+
+            return round(active_hours, 2)
+
+    def calculate_waiting_hours_from_orders(self, driver_uuid: str, start_ts: int, end_ts: int) -> float:
+        """
+        Calculate waiting time between orders.
+        This estimates the time driver was online but waiting for orders.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Get all orders for this period, sorted by acceptance time
+            cursor.execute('''
+                SELECT 
+                    order_accepted_timestamp,
+                    order_finished_timestamp
+                FROM orders
+                WHERE driver_uuid = ?
+                AND order_status = 'finished'
+                AND order_finished_timestamp >= ?
+                AND order_finished_timestamp < ?
+                AND order_accepted_timestamp IS NOT NULL
+                AND order_finished_timestamp IS NOT NULL
+                ORDER BY order_accepted_timestamp
+            ''', (driver_uuid, start_ts, end_ts))
+
+            orders = cursor.fetchall()
+
+            if len(orders) <= 1:
+                return 0.0  # No waiting time with 0 or 1 order
+
+            total_waiting_seconds = 0
+
+            # Calculate gaps between consecutive orders
+            for i in range(1, len(orders)):
+                prev_finished = orders[i - 1][1]
+                curr_accepted = orders[i][0]
+
+                gap = curr_accepted - prev_finished
+
+                if gap > 0:
+                    # Consider gaps up to 30 minutes as waiting time
+                    # Longer gaps are likely breaks/offline periods
+                    if gap <= 1800:  # 30 minutes
+                        total_waiting_seconds += gap
+                    elif gap <= 3600:  # 1 hour
+                        # For gaps 30-60 minutes, count partial waiting time
+                        total_waiting_seconds += 1800  # Count max 30 minutes
+                    # Gaps over 1 hour are considered offline time
+
+            # Convert to hours with proper rounding
+            total_minutes = round(total_waiting_seconds / 60)
+            waiting_hours = total_minutes / 60
+
+            return round(waiting_hours, 2)
