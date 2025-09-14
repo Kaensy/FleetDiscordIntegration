@@ -400,51 +400,78 @@ class FleetDatabase:
 
             return [(idx + 1, row[0], row[1]) for idx, row in enumerate(cursor.fetchall())]
 
-
-
-    def get_company_earnings(self, days: Optional[int] = None) -> Dict[str, Any]:
-        """Get company-wide earnings statistics with date range"""
+    def get_company_earnings_by_date_range(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+        """Get company-wide earnings statistics for a specific date range"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
-            # Build query based on days parameter
-            if days:
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days)
-                start_ts = int(start_date.timestamp())
-                end_ts = int(end_date.timestamp())
-                time_filter = "WHERE order_finished_timestamp >= ? AND order_finished_timestamp < ? AND order_status = 'finished'"
-                params = (start_ts, end_ts)
-                date_range = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d')}"
-            else:
-                time_filter = "WHERE order_status = 'finished'"
-                params = ()
-                date_range = "All Time"
+            # Convert dates to timestamps
+            start_ts = int(start_date.timestamp())
+            end_ts = int(end_date.timestamp())
 
-            cursor.execute(f'''
+            # Main query for company stats
+            cursor.execute('''
                 SELECT 
                     COUNT(*) as trips_completed,
                     COALESCE(SUM(ride_price), 0) as gross_earnings,
+                    COALESCE(SUM(commission), 0) as total_fees,
                     COALESCE(SUM(net_earnings), 0) as net_earnings,
-                    COALESCE(SUM(ride_distance) / 1000.0, 0) as total_distance
+                    COALESCE(SUM(ride_distance) / 1000.0, 0) as total_distance,
+                    COALESCE(AVG(rating), 0) as avg_rating,
+                    COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN (ride_price - commission) ELSE 0 END), 0) as cash_collected
                 FROM orders
-                {time_filter}
-            ''', params)
+                WHERE order_finished_timestamp >= ? 
+                AND order_finished_timestamp < ?
+                AND order_status = 'finished'
+            ''', (start_ts, end_ts))
 
             row = cursor.fetchone()
 
             # Calculate derived metrics
-            earnings_per_trip = row[1] / row[0] if row[0] > 0 else 0
-            earnings_per_km = row[1] / row[3] if row[3] > 0 else 0
+            trips = row[0] or 0
+            gross = row[1] or 0
+            total_distance = row[4] or 0
+
+            earnings_per_trip = gross / trips if trips > 0 else 0
+            earnings_per_km = gross / total_distance if total_distance > 0 else 0
+            avg_distance = total_distance / trips if trips > 0 else 0
+
+            # Get driver breakdown
+            cursor.execute('''
+                SELECT 
+                    driver_name,
+                    driver_uuid,
+                    COUNT(*) as trips,
+                    COALESCE(SUM(ride_price), 0) as earnings
+                FROM orders
+                WHERE order_finished_timestamp >= ? 
+                AND order_finished_timestamp < ?
+                AND order_status = 'finished'
+                GROUP BY driver_uuid
+                ORDER BY earnings DESC
+            ''', (start_ts, end_ts))
+
+            driver_breakdown = []
+            for driver_row in cursor.fetchall():
+                driver_breakdown.append({
+                    'name': driver_row[0],
+                    'uuid': driver_row[1],
+                    'trips': driver_row[2],
+                    'earnings': round(driver_row[3], 2)
+                })
 
             return {
-                'trips_completed': row[0] or 0,
+                'trips_completed': trips,
                 'gross_earnings': round(row[1], 2),
-                'net_earnings': round(row[2], 2),
+                'total_fees': round(row[2], 2),
+                'net_earnings': round(row[3], 2),
+                'total_distance': round(total_distance, 1),
+                'avg_distance': round(avg_distance, 1),
                 'earnings_per_trip': round(earnings_per_trip, 2),
                 'earnings_per_km': round(earnings_per_km, 2),
-                'total_distance': round(row[3], 1),
-                'date_range': date_range
+                'avg_rating': round(row[5], 1) if row[5] > 0 else 0,
+                'cash_collected': round(row[6], 2),
+                'driver_breakdown': driver_breakdown
             }
 
     def get_database_stats(self) -> Dict[str, Any]:

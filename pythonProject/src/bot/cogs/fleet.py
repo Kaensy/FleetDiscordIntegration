@@ -12,10 +12,16 @@ logger = logging.getLogger(__name__)
 COMPANY_START_DATE = datetime(2025, 7, 28)
 
 
+def in_channel(channel_ids: list[int]):
+    def predicate(ctx):
+        return ctx.channel.id in channel_ids
+    return commands.check(predicate)
+
+
 class CalendarNavigationView(ui.View):
     """Base view for calendar navigation"""
 
-    def __init__(self, callback_func, driver_uuid: str, driver_name: str, timeout: int = 180):
+    def __init__(self, callback_func, driver_uuid: str = None, driver_name: str = None, timeout: int = 180):
         super().__init__(timeout=timeout)
         self.callback_func = callback_func
         self.driver_uuid = driver_uuid
@@ -520,6 +526,202 @@ class FleetCommands(commands.Cog):
         self.bot = bot
         self.bolt_client = bot.bolt_client
 
+    @commands.hybrid_command(name="help", description="Show all available commands")
+    async def help_command(self, ctx):
+        """Display all available commands with descriptions"""
+        try:
+            embed = discord.Embed(
+                title="📚 DesiSquad Fleet Bot Commands",
+                description="Here are all the available commands:",
+                color=0x0099ff,
+                timestamp=datetime.now()
+            )
+
+            # General Commands
+            embed.add_field(
+                name="📋 General Commands",
+                value=(
+                    "**!help** - Show this help message\n"
+                    "**!sync** - Sync database with Bolt API (cooldown: 60s)\n"
+                    "**!fleet-stats** - Display fleet overview statistics"
+                ),
+                inline=False
+            )
+
+            # Driver Commands
+            embed.add_field(
+                name="👥 Driver Commands",
+                value=(
+                    "**!drivers** - List all drivers with their numbers\n"
+                    "**!driver-stats [number]** - Get detailed driver statistics with calendar selection"
+                ),
+                inline=False
+            )
+
+            # Company Commands
+            embed.add_field(
+                name="🏢 Company Commands",
+                value=(
+                    "**!company-earnings** - View company earnings with calendar selection"
+                ),
+                inline=False
+            )
+
+            # Admin Commands (if the user has admin permissions)
+            if ctx.author.guild_permissions.administrator:
+                embed.add_field(
+                    name="⚙️ Admin Commands",
+                    value=(
+                        "**!set-report-channel [channel]** - Set channel for automated reports\n"
+                        "**!test-midnight-report** - Test the daily report functionality\n"
+                        "**!force-sync** - Force immediate database sync"
+                    ),
+                    inline=False
+                )
+
+            # Footer with additional info
+            embed.set_footer(text="Use !command or /command for slash commands • Data updates every 10 minutes")
+
+            if hasattr(ctx, 'followup'):
+                await ctx.followup.send(embed=embed)
+            else:
+                await ctx.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Help command failed: {e}")
+            await ctx.send("❌ Failed to display help information.")
+
+    @commands.hybrid_command(name="company-earnings", description="Get company earnings with calendar selection")
+    @commands.has_role("Admin")
+    @in_channel([1415574639731802223])
+    async def company_earnings(self, ctx):
+        """Display company earnings with interactive calendar selection"""
+        try:
+            if hasattr(ctx, 'defer'):
+                await ctx.defer()
+            else:
+                async with ctx.typing():
+                    pass
+
+            # Show initial selection view (reusing the same calendar navigation)
+            view = InitialSelectView(self._show_company_earnings)
+
+            embed = discord.Embed(
+                title="💰 DesiSquad Company Earnings",
+                description="Select a time period to view company earnings:",
+                color=0x00d4aa
+            )
+
+            if hasattr(ctx, 'followup'):
+                await ctx.followup.send(embed=embed, view=view)
+            else:
+                await ctx.send(embed=embed, view=view)
+
+        except Exception as e:
+            logger.error(f"Company earnings command failed: {e}")
+            await ctx.send(f"❌ Failed to fetch earnings: {str(e)}")
+
+    async def _show_company_earnings(self, interaction: discord.Interaction, date_input, driver_uuid=None,
+                                     view_type: str = None):
+        """Show company earnings for selected period"""
+        try:
+            # Calculate date range based on view type
+            if view_type == 'day':
+                start_date = date_input.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = start_date + timedelta(days=1)
+                period_text = start_date.strftime('%B %d, %Y')
+            elif view_type == 'week':
+                start_date, end_date = date_input
+                period_text = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
+            elif view_type == 'month':
+                start_date = date_input.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                if start_date.month == 12:
+                    end_date = start_date.replace(year=start_date.year + 1, month=1)
+                else:
+                    end_date = start_date.replace(month=start_date.month + 1)
+                period_text = start_date.strftime('%B %Y')
+            elif view_type == 'year':
+                start_date = date_input.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                end_date = start_date.replace(year=start_date.year + 1)
+                period_text = str(start_date.year)
+            elif view_type == 'custom':
+                start_date, end_date = date_input
+                start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = end_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                period_text = f"{start_date.strftime('%b %d')} - {(end_date - timedelta(days=1)).strftime('%b %d, %Y')}"
+            else:
+                raise ValueError(f"Unknown view type: {view_type}")
+
+            # Get company earnings from database
+            stats = self.bolt_client.db.get_company_earnings_by_date_range(start_date, end_date)
+
+            if not stats or stats['trips_completed'] == 0:
+                await interaction.followup.send("No data found for this period.")
+                return
+
+            # Create earnings embed
+            embed = discord.Embed(
+                title=f"💰 DesiSquad Earnings - {period_text}",
+                color=0x00d4aa,
+                timestamp=datetime.now()
+            )
+
+            # Earnings section
+            embed.add_field(
+                name="💵 Earnings",
+                value=(
+                    f"**Gross Earnings:** {stats['gross_earnings']} RON\n"
+                    f"**Total Fees:** {stats['total_fees']} RON\n"
+                    f"**Net Earnings:** {stats['net_earnings']} RON\n"
+                    f"**💸 Cash Collected:** {stats['cash_collected']} RON"
+                ),
+                inline=False
+            )
+
+            # Trips section
+            embed.add_field(
+                name="📊 Trips",
+                value=(
+                    f"**Trips Completed:** {stats['trips_completed']}\n"
+                    f"**Total Distance:** {stats['total_distance']} km\n"
+                    f"**Average Distance:** {stats['avg_distance']} km/trip"
+                ),
+                inline=False
+            )
+
+            # Metrics section
+            embed.add_field(
+                name="📈 Performance Metrics",
+                value=(
+                    f"**Earnings/Trip:** {stats['earnings_per_trip']} RON\n"
+                    f"**Earnings/KM:** {stats['earnings_per_km']} RON/km\n"
+                    f"**Average Rating:** {stats['avg_rating']}/5 ⭐" if stats[
+                                                                            'avg_rating'] > 0 else f"**Earnings/Trip:** {stats['earnings_per_trip']} RON\n**Earnings/KM:** {stats['earnings_per_km']} RON/km"
+                ),
+                inline=False
+            )
+
+            # Driver breakdown if available
+            if stats.get('driver_breakdown'):
+                driver_text = []
+                for driver in stats['driver_breakdown'][:5]:  # Top 5 drivers
+                    driver_text.append(f"**{driver['name']}:** {driver['trips']} trips, {driver['earnings']} RON")
+
+                if driver_text:
+                    embed.add_field(
+                        name="🏆 Top Drivers",
+                        value="\n".join(driver_text),
+                        inline=False
+                    )
+
+            embed.set_footer(text=f"View Type: {view_type.capitalize()} • Data from local database")
+
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Failed to show company earnings: {e}")
+            await interaction.followup.send(f"❌ Failed to fetch earnings: {str(e)}")
+
     @commands.hybrid_command(name="driver-stats", description="Get driver statistics with interactive calendar")
     async def driver_stats(self, ctx, driver_number: int):
         """Display driver statistics with interactive calendar selection"""
@@ -556,8 +758,6 @@ class FleetCommands(commands.Cog):
         except Exception as e:
             logger.error(f"Driver stats command failed: {e}")
             await ctx.send(f"❌ Failed to fetch driver stats: {str(e)}")
-
-    # Replace the _show_driver_stats method in fleet.py with this version
 
     async def _show_driver_stats(self, interaction: discord.Interaction, date_input, driver_uuid: str, view_type: str):
         """Show driver stats with complete time tracking"""
