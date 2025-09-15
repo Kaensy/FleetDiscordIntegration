@@ -760,39 +760,63 @@ class FleetCommands(commands.Cog):
             await ctx.send(f"❌ Failed to fetch driver stats: {str(e)}")
 
     async def _show_driver_stats(self, interaction: discord.Interaction, date_input, driver_uuid: str, view_type: str):
-        """Show driver stats with complete time tracking"""
+        """Show driver stats with complete time tracking (Romania-local periods, UTC queries)"""
         try:
-            # Calculate date range based on view type
-            if view_type == 'day':
-                start_date = date_input.replace(hour=0, minute=0, second=0, microsecond=0)
-                end_date = start_date + timedelta(days=1)
-                period_text = start_date.strftime('%B %d, %Y')
-            elif view_type == 'week':
-                start_date, end_date = date_input
-                period_text = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
-            elif view_type == 'month':
-                start_date = date_input.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-                if start_date.month == 12:
-                    end_date = start_date.replace(year=start_date.year + 1, month=1)
+            import pytz
+            romania_tz = pytz.timezone("Europe/Bucharest")
+            utc = pytz.UTC
+
+            # Normalize input -> Romania tz
+            def to_romania(d: datetime) -> datetime:
+                if d.tzinfo is None:
+                    return romania_tz.localize(d)
+                return d.astimezone(romania_tz)
+
+            # Calculate start_date and end_date (Romania), then convert to UTC
+            if view_type == "day":
+                local_start = to_romania(date_input).replace(hour=0, minute=0, second=0, microsecond=0)
+                local_end = local_start + timedelta(days=1)
+                period_text = local_start.strftime("%B %d, %Y")
+
+            elif view_type == "week":
+                week_start, week_end = date_input
+                local_start = to_romania(week_start).replace(hour=0, minute=0, second=0, microsecond=0)
+                local_end = to_romania(week_end).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                period_text = f"{local_start.strftime('%b %d')} - {week_end.strftime('%b %d, %Y')}"
+
+            elif view_type == "month":
+                local_start = to_romania(date_input).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                if local_start.month == 12:
+                    local_end = local_start.replace(year=local_start.year + 1, month=1)
                 else:
-                    end_date = start_date.replace(month=start_date.month + 1)
-                period_text = start_date.strftime('%B %Y')
-            elif view_type == 'year':
-                start_date = date_input.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-                end_date = start_date.replace(year=start_date.year + 1)
-                period_text = str(start_date.year)
-            elif view_type == 'custom':
-                start_date, end_date = date_input
-                start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                end_date = end_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                period_text = f"{start_date.strftime('%b %d')} - {(end_date - timedelta(days=1)).strftime('%b %d, %Y')}"
+                    local_end = local_start.replace(month=local_start.month + 1)
+                period_text = local_start.strftime("%B %Y")
+
+            elif view_type == "year":
+                local_start = to_romania(date_input).replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                local_end = local_start.replace(year=local_start.year + 1)
+                period_text = str(local_start.year)
+
+            elif view_type == "custom":
+                custom_start, custom_end = date_input
+                local_start = to_romania(custom_start).replace(hour=0, minute=0, second=0, microsecond=0)
+                local_end = to_romania(custom_end).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+                    days=1)
+                period_text = f"{local_start.strftime('%b %d')} - {custom_end.strftime('%b %d, %Y')}"
+
             else:
                 raise ValueError(f"Unknown view type: {view_type}")
 
-            # Fetch state logs only for periods <= 31 days (API limit)
+            # Convert to UTC for querying
+            start_date = local_start.astimezone(utc)
+            end_date = local_end.astimezone(utc)
+
+            logger.info(f"[{view_type}] period {period_text}")
+            logger.info(f"Querying from {start_date} to {end_date} (UTC)")
+
+            # Fetch state logs if within 31 days
             state_logs = []
             days_diff = (end_date - start_date).days
-
             if days_diff <= 31:
                 async with self.bolt_client:
                     try:
@@ -801,14 +825,15 @@ class FleetCommands(commands.Cog):
                             end_date=end_date,
                             limit=1000
                         )
-                        if state_response.get('code') == 0:
-                            state_logs = state_response.get('data', {}).get('state_logs', [])
+                        if state_response.get("code") == 0:
+                            state_logs = state_response.get("data", {}).get("state_logs", [])
+                            logger.info(f"Fetched {len(state_logs)} state logs")
                     except Exception as e:
                         logger.warning(f"Could not fetch state logs: {e}")
             else:
-                logger.info(f"Period > 31 days, skipping state logs fetch")
+                logger.info(f"Period > 31 days ({days_diff}), skipping state logs fetch")
 
-            # Get stats using the complete method with both active and waiting hours
+            # Get stats
             stats = self.bolt_client.db.get_driver_stats_by_date_range(
                 driver_uuid,
                 start_date,
@@ -817,14 +842,14 @@ class FleetCommands(commands.Cog):
             )
 
             if not stats:
-                await interaction.followup.send("No data found for this period.")
+                await interaction.followup.send(f"No data found for this period ({period_text}).")
                 return
 
-            # Create embed with enhanced stats
+            # Build embed
             embed = discord.Embed(
                 title=f"👤 {stats['driver_name']} - {period_text}",
                 color=0xff9500,
-                timestamp=datetime.now()
+                timestamp=datetime.now(utc)
             )
 
             embed.add_field(
@@ -838,13 +863,11 @@ class FleetCommands(commands.Cog):
                 inline=False
             )
 
-            # Format hours display
+            # Hours
             active_h = int(stats['hours_worked'])
             active_m = int((stats['hours_worked'] - active_h) * 60)
-
             total_h = int(stats['total_online_hours'])
             total_m = int((stats['total_online_hours'] - total_h) * 60)
-
             waiting_h = int(stats['waiting_hours'])
             waiting_m = int((stats['waiting_hours'] - waiting_h) * 60)
 
@@ -860,7 +883,7 @@ class FleetCommands(commands.Cog):
                 inline=False
             )
 
-            # Calculate net earnings per hour
+            # Performance metrics
             net_per_hour_total = stats['net_earnings'] / stats['total_online_hours'] if stats[
                                                                                             'total_online_hours'] > 0 else 0
             net_per_hour_active = stats['net_earnings'] / stats['hours_worked'] if stats['hours_worked'] > 0 else 0
@@ -875,8 +898,8 @@ class FleetCommands(commands.Cog):
                 inline=False
             )
 
-            # Add comparison note if waiting time was estimated
-            footer_text = f"View Type: {view_type.capitalize()}"
+            # Footer
+            footer_text = f"View Type: {view_type.capitalize()} | Romania time (local)"
             if stats['waiting_hours'] > 0 and not state_logs:
                 footer_text += " | Waiting time estimated from order gaps"
             elif state_logs:
