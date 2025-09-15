@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: bolt-fleet-discord-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.main
+    envVars:
+      - key: BOLT_CLIENT_ID
+        sync: false
+      - key: BOLT_CLIENT_SECRET
+        sync: false
+      - key: BOLT_COMPANY_ID
+        sync: false
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_IDS
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO

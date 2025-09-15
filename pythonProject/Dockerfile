@@ -13,10 +13,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ ./src/
-COPY .env .
+COPY .env* ./
 
-# Create logs directory
-RUN mkdir -p logs
+# Create directories for data persistence
+RUN mkdir -p data logs
+
+# Expose the port that Render expects
+EXPOSE $PORT
 
 # Run the application
 CMD ["python", "-m", "src.main"]
